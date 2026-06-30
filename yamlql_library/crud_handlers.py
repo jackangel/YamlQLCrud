@@ -1093,8 +1093,15 @@ class UpdateHandler:
                         table_name, col_name, yaml_path, writer.data
                     )
                     
+                    # Strip "root." prefix for writer (same as DELETE handler)
+                    writer_path = self._strip_root_prefix(target_path)
+                    
                     # Update the value in YAML
-                    writer.set_value(target_path, new_value)
+                    if writer_path:
+                        writer.set_value(writer_path, new_value)
+                    else:
+                        # Updating root itself (rare case)
+                        writer.data = new_value
         
         return len(matching_rows)
     
@@ -1158,6 +1165,32 @@ class UpdateHandler:
         else:
             # Custom path - append column name
             return f"{row_yaml_path}.{original_col}"
+    
+    def _strip_root_prefix(self, yaml_path: str) -> str:
+        """
+        Strip 'root.' prefix from yaml_path for writer operations.
+        
+        The _yaml_path column tracks paths like "root.users.0", but YamlWriter
+        expects paths relative to data root like "users.0".
+        
+        Args:
+            yaml_path: Full yaml_path with root prefix
+            
+        Returns:
+            Path without root prefix, or empty string if path is exactly "root"
+            
+        Examples:
+            "root.users.0" → "users.0"
+            "root.0" → "0"
+            "root" → ""
+        """
+        if yaml_path == "root":
+            return ""
+        elif yaml_path.startswith("root."):
+            return yaml_path[5:]  # Strip "root."
+        else:
+            # Path doesn't start with root (shouldn't happen, but handle gracefully)
+            return yaml_path
     
     def _update_database(
         self,
