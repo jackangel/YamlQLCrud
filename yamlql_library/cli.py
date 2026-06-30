@@ -93,24 +93,38 @@ def sql_command(
     sql_file: str = typer.Option(None, "--sql-file", help="Path to a file containing the SQL query."),
     output: OutputFormat = typer.Option(OutputFormat.AUTO, "--output", "-o", help="Output format.", envvar="YAMLQL_OUTPUT"),
     max_depth: int = typer.Option(5, "--max-depth", help="Maximum recursion depth for 'depth' strategy.", envvar="YAMLQL_MAX_DEPTH"),
-    strategy: Strategy = typer.Option(Strategy.DEPTH, "--strategy", help="The table creation strategy to use.", envvar="YAMLQL_STRATEGY")
+    strategy: Strategy = typer.Option(Strategy.DEPTH, "--strategy", help="The table creation strategy to use.", envvar="YAMLQL_STRATEGY"),
+    writable: bool = typer.Option(False, "--writable", "-w", help="Enable write operations (INSERT/UPDATE/DELETE).")
 ):
     """
     Run a SQL query against a YAML file.
 
+    By default, only read operations (SELECT) are allowed.
+    Use --writable flag to enable write operations (INSERT/UPDATE/DELETE).
+
     If a query is provided as an argument or via --sql-file, it is executed directly.
     If no query is provided, an interactive SQL prompt is started for exploratory querying.
+    
+    Examples:
+        yamlql sql data.yaml "SELECT * FROM users"
+        yamlql sql data.yaml --writable "INSERT INTO users VALUES ('Alice', 30)"
+        yamlql sql data.yaml -w "UPDATE users SET age = 31 WHERE name = 'Alice'"
     """
+    if writable:
+        rich.print("[yellow]⚠ Write mode enabled. Changes will be saved to the file.[/yellow]")
+    
+    mode = "rw" if writable else "r"
+    
     if sql_file:
         with open(sql_file, 'r') as f:
             sql_query_str = f.read().strip()
-        cli_logic.run_query(sql_query_str, file, output, max_depth, strategy)
+        cli_logic.run_query(sql_query_str, file, output, max_depth, strategy, mode)
     elif sql_query:
         sql_query_str = " ".join(sql_query)
-        cli_logic.run_query(sql_query_str, file, output, max_depth, strategy)
+        cli_logic.run_query(sql_query_str, file, output, max_depth, strategy, mode)
     else:
         # No query provided, start interactive mode
-        cli_logic.run_interactive_sql(file, output, max_depth, strategy)
+        cli_logic.run_interactive_sql(file, output, max_depth, strategy, mode)
 
 
 @app.command()
@@ -157,13 +171,21 @@ def ai_command(
         "-o", 
         help="Output format.",
         envvar="YAMLQL_OUTPUT"
-    )
+    ),
+    writable: bool = typer.Option(False, "--writable", "-w", help="Enable write operations (INSERT/UPDATE/DELETE).")
 ):
     """
     Answers a natural language question about a YAML file by generating and executing a SQL query.
     Requires environment variables for the chosen LLM provider (e.g., YAMLQL_LLM_PROVIDER and OPENAI_API_KEY).
+    
+    By default, only read operations (SELECT) are allowed.
+    Use --writable flag to enable write operations.
     """
-    cli_logic.run_nlp(question, file, output)
+    if writable:
+        rich.print("[yellow]⚠ Write mode enabled. Changes will be saved to the file.[/yellow]")
+    
+    mode = "rw" if writable else "r"
+    cli_logic.run_nlp(question, file, output, mode)
 
 if __name__ == "__main__":
     app() 

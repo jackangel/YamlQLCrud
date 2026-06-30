@@ -12,11 +12,11 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 
-def run_query(sql_query: str, file: str, output: OutputFormat, max_depth: int = 5, strategy: str = "depth"):
+def run_query(sql_query: str, file: str, output: OutputFormat, max_depth: int = 5, strategy: str = "depth", mode: str = "r"):
     """Core logic for the 'query' command."""
     yql = None
     try:
-        yql = YamlQL(file_path=file, max_depth=max_depth, strategy=strategy)
+        yql = YamlQL(file_path=file, max_depth=max_depth, strategy=strategy, mode=mode)
         results = yql.query(sql_query)
 
         if results.empty:
@@ -42,11 +42,11 @@ def run_query(sql_query: str, file: str, output: OutputFormat, max_depth: int = 
         if yql:
             yql.close()
 
-def run_interactive_sql(file: str, output: OutputFormat, max_depth: int = 5, strategy: str = "depth"):
+def run_interactive_sql(file: str, output: OutputFormat, max_depth: int = 5, strategy: str = "depth", mode: str = "r"):
     """Starts an interactive SQL prompt."""
     yql = None
     try:
-        yql = YamlQL(file_path=file, max_depth=max_depth, strategy=strategy)
+        yql = YamlQL(file_path=file, max_depth=max_depth, strategy=strategy, mode=mode)
         rich.print(f"[bold green]Connected to {file}.[/bold green]")
         rich.print("Enter SQL commands (end with a semicolon) or interactive commands.")
         rich.print("Interactive commands: [bold cyan]listtables[/bold cyan], [bold cyan]listfields <table_name>[/bold cyan], [bold cyan]exit[/bold cyan]")
@@ -131,11 +131,11 @@ def run_interactive_sql(file: str, output: OutputFormat, max_depth: int = 5, str
             yql.close()
         rich.print("[bold]Exiting YamlQL.[/bold]")
 
-def run_nlp(question: str, file: str, output: OutputFormat):
-    """Core logic for the 'nlp' command."""
+def run_nlp(question: str, file: str, output: OutputFormat, mode: str = "r"):
+    """Core logic for the 'ai' command."""
     yql = None
     try:
-        yql = YamlQL(file_path=file)
+        yql = YamlQL(file_path=file, mode=mode)
         
         schema_lines = []
         for row in yql.db.con.execute("SHOW ALL TABLES;").fetchall():
