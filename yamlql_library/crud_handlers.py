@@ -784,7 +784,21 @@ class UpdateHandler:
             rows_updated = self._update_rows(table_name, matching_rows, set_clauses)
             
             # Step 5: Update in-memory database
-            self._update_database(table_name, set_clauses, where_clause)
+            try:
+                self._update_database(table_name, set_clauses, where_clause)
+            except RuntimeError as db_error:
+                # Database sync failed, but YAML write succeeded
+                # Return success with warning to reload
+                import warnings
+                warnings.warn(str(db_error))
+                return {
+                    'success': True,
+                    'rows_updated': rows_updated,
+                    'message': (
+                        f"{rows_updated} row{'s' if rows_updated != 1 else ''} updated in {table_name}. "
+                        f"Warning: In-memory database out of sync. Create a new YamlQL instance to reload."
+                    )
+                }
             
             return {
                 'success': True,
@@ -941,8 +955,10 @@ class UpdateHandler:
             return None
         
         where_expr = parsed_sql.args['where']
-        # Convert WHERE expression back to SQL string
-        return str(where_expr)
+        # Get the condition expression (without WHERE keyword)
+        # where_expr is a Where object, where_expr.this is the actual condition
+        condition_expr = where_expr.this
+        return str(condition_expr)
     
     def _validate_table_exists(self, table_name: str) -> None:
         """
@@ -1314,7 +1330,21 @@ class DeleteHandler:
             rows_deleted = self._delete_rows(table_name, matching_rows)
             
             # Step 5: Update in-memory database
-            self._update_database(table_name, where_clause)
+            try:
+                self._update_database(table_name, where_clause)
+            except RuntimeError as db_error:
+                # Database sync failed, but YAML write succeeded
+                # Return success with warning to reload
+                import warnings
+                warnings.warn(str(db_error))
+                return {
+                    'success': True,
+                    'rows_deleted': rows_deleted,
+                    'message': (
+                        f"{rows_deleted} row{'s' if rows_deleted != 1 else ''} deleted from {table_name}. "
+                        f"Warning: In-memory database out of sync. Create a new YamlQL instance to reload."
+                    )
+                }
             
             return {
                 'success': True,
@@ -1373,8 +1403,10 @@ class DeleteHandler:
             return None
         
         where_expr = parsed_sql.args['where']
-        # Convert WHERE expression back to SQL string
-        return str(where_expr)
+        # Get the condition expression (without WHERE keyword)
+        # where_expr is a Where object, where_expr.this is the actual condition
+        condition_expr = where_expr.this
+        return str(condition_expr)
     
     def _validate_table_exists(self, table_name: str) -> None:
         """
@@ -1467,13 +1499,48 @@ class DeleteHandler:
             # Delete each YAML node
             for yaml_path in yaml_paths_sorted:
                 try:
-                    writer.delete_value(yaml_path)
+                    # Strip "root." prefix if present - the writer works with paths relative to data root
+                    # _yaml_path format: "root.users.0" or "root.0" or "root"
+                    writer_path = self._strip_root_prefix(yaml_path)
+                    
+                    if writer_path:
+                        writer.delete_value(writer_path)
+                    else:
+                        # Special case: deleting root itself (should rarely happen)
+                        import sys
+                        print(f"Warning: Cannot delete root path '{yaml_path}'", file=sys.stderr)
                 except ValueError as e:
                     # Log warning but continue with other deletions
                     import sys
                     print(f"Warning: Failed to delete path '{yaml_path}': {e}", file=sys.stderr)
         
         return len(matching_rows)
+    
+    def _strip_root_prefix(self, yaml_path: str) -> str:
+        """
+        Strip 'root.' prefix from yaml_path for writer operations.
+        
+        The _yaml_path column tracks paths like "root.users.0", but YamlWriter
+        expects paths relative to data root like "users.0".
+        
+        Args:
+            yaml_path: Full yaml_path with root prefix
+            
+        Returns:
+            Path without root prefix, or empty string if path is exactly "root"
+            
+        Examples:
+            "root.users.0" → "users.0"
+            "root.0" → "0"
+            "root" → ""
+        """
+        if yaml_path == "root":
+            return ""
+        elif yaml_path.startswith("root."):
+            return yaml_path[5:]  # Strip "root."
+        else:
+            # Path doesn't start with root (shouldn't happen, but handle gracefully)
+            return yaml_path
     
     def _sort_paths_for_deletion(self, yaml_paths: List[str]) -> List[str]:
         """
