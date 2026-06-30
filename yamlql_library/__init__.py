@@ -34,6 +34,9 @@ class YamlQL:
         # 1. Load the data
         loader = YamlLoader(path)
         data = loader.load()
+        
+        # Store original data for CRUD operations (needed by handlers)
+        self.original_data = data
 
         # 2. Transform the data
         transformer = DataTransformer(data, max_depth=max_depth, strategy=strategy)
@@ -45,6 +48,13 @@ class YamlQL:
         # 3. Setup the database (pass mode and file_path for write operations)
         self._db = Database(mode=self.mode, file_path=self.file_path)
         self._db.create_tables(self.tables)
+        
+        # 4. Initialize CRUD handlers if in write mode
+        if self.mode in ['rw', 'w']:
+            self._db.initialize_crud_handlers(
+                column_name_map=self.column_name_map,
+                original_data=self.original_data
+            )
 
     def query(self, sql_query: str) -> pd.DataFrame:
         """
