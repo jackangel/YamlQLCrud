@@ -1,0 +1,3 @@
+services:
+  - name: database
+    port: 5432
