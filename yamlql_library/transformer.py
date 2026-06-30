@@ -175,7 +175,11 @@ class DataTransformer:
         should_stop_recursing = depth >= self.max_depth
 
         if isinstance(node_value, list):
-            if not node_value: return
+            if not node_value:
+                # Create empty table for empty lists to support INSERT operations
+                df = pd.DataFrame({'_yaml_path': []})
+                tables_list.append((table_name, df))
+                return
             if all(isinstance(item, dict) for item in node_value):
                 # Always use _normalize_records for lists of objects to get proper flattening
                 tables_list.extend(self._normalize_records(table_name, node_value, current_path))

@@ -109,7 +109,21 @@ class InsertHandler:
             rows_inserted = self._insert_rows(table_name, columns, rows)
             
             # Step 4: Update in-memory database
-            self._update_database(table_name, columns, rows)
+            try:
+                self._update_database(table_name, columns, rows)
+            except RuntimeError as db_error:
+                # Database sync failed, but YAML write succeeded
+                # Return success with warning to reload
+                import warnings
+                warnings.warn(str(db_error))
+                return {
+                    'success': True,
+                    'rows_inserted': rows_inserted,
+                    'message': (
+                        f"{rows_inserted} row{'s' if rows_inserted != 1 else ''} inserted into {table_name}. "
+                        f"Warning: In-memory database out of sync. Create a new YamlQL instance to reload."
+                    )
+                }
             
             return {
                 'success': True,
@@ -141,13 +155,36 @@ class InsertHandler:
             raise ValueError("INSERT statement missing target table")
         
         # Get table name from the 'this' attribute
-        table_expr = parsed_sql.this
+        # In sqlglot, INSERT has: this=Schema(this=Table(this=Identifier(this='name')))
+        schema_expr = parsed_sql.this
         
-        if hasattr(table_expr, 'name'):
-            table_name = table_expr.name
+        # Navigate: Schema.this -> Table
+        if hasattr(schema_expr, 'this'):
+            table_expr = schema_expr.this
+            
+            # Navigate: Table.this -> Identifier
+            if hasattr(table_expr, 'this'):
+                identifier = table_expr.this
+                
+                # Get name from Identifier
+                if hasattr(identifier, 'this'):
+                    table_name = str(identifier.this)
+                elif hasattr(identifier, 'name'):
+                    table_name = identifier.name
+                else:
+                    table_name = str(identifier).strip('"').strip("'").strip('`')
+            elif hasattr(table_expr, 'name'):
+                table_name = table_expr.name
+            else:
+                table_name = str(table_expr).strip('"').strip("'").strip('`')
+        elif hasattr(schema_expr, 'name'):
+            table_name = schema_expr.name
         else:
             # Fallback to string representation
-            table_name = str(table_expr).strip('"').strip("'").strip('`')
+            table_name = str(schema_expr).strip('"').strip("'").strip('`')
+            # Extract just the table name if it has a schema prefix
+            if ' ' in table_name:
+                table_name = table_name.split()[0]
         
         if not table_name:
             raise ValueError("Could not extract table name from INSERT statement")
@@ -172,11 +209,15 @@ class InsertHandler:
             ValueError: If columns cannot be determined
         """
         # Check if columns are explicitly specified
-        if parsed_sql.this and hasattr(parsed_sql.this, 'columns') and parsed_sql.this.columns:
+        # In sqlglot INSERT: this=Schema(this=Table, expressions=[col1, col2, ...])
+        if parsed_sql.this and hasattr(parsed_sql.this, 'expressions') and parsed_sql.this.expressions:
             # Explicit columns: INSERT INTO table (col1, col2) VALUES (...)
             columns = []
-            for col in parsed_sql.this.columns:
-                if hasattr(col, 'name'):
+            for col in parsed_sql.this.expressions:
+                if hasattr(col, 'this'):
+                    # It's an Identifier with 'this' attribute
+                    columns.append(str(col.this))
+                elif hasattr(col, 'name'):
                     columns.append(col.name)
                 else:
                     columns.append(str(col).strip('"').strip("'"))
@@ -337,20 +378,28 @@ class InsertHandler:
         """
         Validate that all columns exist in the table.
         
+        For INSERT operations on empty tables (tables with only _yaml_path column),
+        this validation is skipped since we're adding new data dynamically.
+        
         Args:
             table_name: Table name
             columns: List of column names to validate
             
         Raises:
-            ValueError: If any column does not exist
+            ValueError: If any column does not exist (unless it's an empty table)
         """
         # Get table schema
         schema = self.db.query(f"DESCRIBE {table_name}")
         existing_columns = set(schema['column_name'].tolist())
         
+        # Skip validation for empty tables (only have _yaml_path column)
+        # This allows INSERT to add new columns dynamically
+        if existing_columns == {'_yaml_path'}:
+            return
+        
         # Check each column
         for col in columns:
-            if col not in existing_columns:
+            if col not in existing_columns and col != '_yaml_path':
                 raise ValueError(
                     f"Column '{col}' does not exist in table '{table_name}'. "
                     f"Available columns: {', '.join(sorted(existing_columns))}"
@@ -509,16 +558,67 @@ class InsertHandler:
         Update the in-memory database with newly inserted rows.
         
         This ensures the database state matches the YAML file state after INSERT.
+        If new columns are being added, recreates the DuckDB table with new schema.
         
         Args:
             table_name: Table name
             columns: Column names
             rows: List of row dictionaries to insert
         """
+        # Get existing columns in DuckDB
+        try:
+            schema = self.db.con.execute(f"DESCRIBE {table_name}").fetchdf()
+            existing_cols = set(schema['column_name'].tolist())
+        except Exception:
+            existing_cols = set()
+        
+        # Check if we need to add columns
+        new_cols = [col for col in columns if col not in existing_cols and col != '_yaml_path']
+        
+        if new_cols:
+            # Need to recreate table with new schema
+            # First, get existing data
+            try:
+                existing_data = self.db.con.execute(f"SELECT * FROM {table_name}").fetchdf()
+            except Exception:
+                existing_data = None
+            
+            # Drop and recreate table with new schema
+            try:
+                self.db.con.execute(f"DROP TABLE IF EXISTS {table_name}")
+                
+                # Build CREATE TABLE statement with all columns
+                all_cols = ['_yaml_path VARCHAR'] + [
+                    f"{col} {self._infer_duckdb_type(next((row.get(col) for row in rows if col in row), None))}"
+                    for col in columns if col != '_yaml_path'
+                ]
+                create_sql = f"CREATE TABLE {table_name} ({', '.join(all_cols)})"
+                self.db.con.execute(create_sql)
+                
+                # Re-insert existing data if any
+                if existing_data is not None and len(existing_data) > 0:
+                    # Only insert columns that exist in both old and new schema
+                    common_cols = [col for col in existing_data.columns if col in columns or col == '_yaml_path']
+                    if common_cols:
+                        cols_str = ", ".join(common_cols)
+                        values_str = ", ".join([
+                            "(" + ", ".join([
+                                self._format_sql_value(row[col]) for col in common_cols
+                            ]) + ")"
+                            for _, row in existing_data.iterrows()
+                        ])
+                        reinsert_sql = f"INSERT INTO {table_name} ({cols_str}) VALUES {values_str}"
+                        self.db.con.execute(reinsert_sql)
+                
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to recreate DuckDB table '{table_name}' with new columns: {e}"
+                ) from e
+        
         # Build INSERT statement for DuckDB
         values_str = ", ".join([
             "(" + ", ".join([
-                self._format_sql_value(row[col]) for col in columns
+                self._format_sql_value(row.get(col)) for col in columns
             ]) + ")"
             for row in rows
         ])
@@ -535,6 +635,27 @@ class InsertHandler:
                 f"YAML file updated successfully, but failed to synchronize in-memory database: {e}. "
                 f"Reload the YamlQL instance to re-sync from file."
             ) from e
+    
+    def _infer_duckdb_type(self, value: Any) -> str:
+        """
+        Infer DuckDB column type from a Python value.
+        
+        Args:
+            value: Sample Python value
+            
+        Returns:
+            DuckDB type string (VARCHAR, INTEGER, DOUBLE, BOOLEAN, etc.)
+        """
+        if value is None:
+            return "VARCHAR"  # Default to VARCHAR for NULL
+        elif isinstance(value, bool):
+            return "BOOLEAN"
+        elif isinstance(value, int):
+            return "INTEGER"
+        elif isinstance(value, float):
+            return "DOUBLE"
+        else:
+            return "VARCHAR"
     
     def _format_sql_value(self, value: Any) -> str:
         """
