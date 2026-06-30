@@ -130,7 +130,7 @@ class Database:
         # Execute SELECT/DDL queries in DuckDB (existing behavior)
         return self.con.execute(sql_query).fetchdf()
     
-    def _handle_insert(self, parsed_sql) -> pd.DataFrame:
+    def _handle_insert(self, parsed_sql) -> Dict[str, Any]:
         """
         Handle INSERT operation via InsertHandler.
         
@@ -138,12 +138,20 @@ class Database:
             parsed_sql: Parsed INSERT statement from SqlInterceptor
             
         Returns:
-            DataFrame containing operation result
+            Dict containing operation result
+            
+        Raises:
+            Exception: If the INSERT operation fails
         """
         result = self.insert_handler.handle(parsed_sql)
-        return pd.DataFrame([result])
+        
+        # If operation failed, raise an exception
+        if not result.get('success', False):
+            raise Exception(result.get('message', 'INSERT operation failed'))
+        
+        return result
     
-    def _handle_update(self, parsed_sql) -> pd.DataFrame:
+    def _handle_update(self, parsed_sql) -> Dict[str, Any]:
         """
         Handle UPDATE operation via UpdateHandler.
         
@@ -151,12 +159,20 @@ class Database:
             parsed_sql: Parsed UPDATE statement from SqlInterceptor
             
         Returns:
-            DataFrame containing operation result
+            Dict containing operation result
+            
+        Raises:
+            Exception: If the UPDATE operation fails
         """
         result = self.update_handler.handle(parsed_sql)
-        return pd.DataFrame([result])
+        
+        # If operation failed, raise an exception
+        if not result.get('success', False):
+            raise Exception(result.get('message', 'UPDATE operation failed'))
+        
+        return result
     
-    def _handle_delete(self, parsed_sql) -> pd.DataFrame:
+    def _handle_delete(self, parsed_sql) -> Dict[str, Any]:
         """
         Handle DELETE operation via DeleteHandler.
         
@@ -164,10 +180,18 @@ class Database:
             parsed_sql: Parsed DELETE statement from SqlInterceptor
             
         Returns:
-            DataFrame containing operation result
+            Dict containing operation result
+            
+        Raises:
+            Exception: If the DELETE operation fails
         """
         result = self.delete_handler.handle(parsed_sql)
-        return pd.DataFrame([result])
+        
+        # If operation failed, raise an exception
+        if not result.get('success', False):
+            raise Exception(result.get('message', 'DELETE operation failed'))
+        
+        return result
 
     def close(self):
         """Closes the database connection."""

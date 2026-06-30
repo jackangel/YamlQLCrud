@@ -122,7 +122,7 @@ def run_interactive_sql(file: str, output: OutputFormat, max_depth: int = 5, str
                 if in_transaction:
                     console.print(f"Pending operations: {len(pending_operations)}")
                 try:
-                    tables = yql.db.con.execute("SHOW ALL TABLES;").fetchall()
+                    tables = yql._db.con.execute("SHOW ALL TABLES;").fetchall()
                     table_names = [t[2] for t in tables]
                     console.print(f"Tables: {', '.join(table_names) if table_names else '(none)'}")
                 except:
@@ -198,7 +198,7 @@ def run_interactive_sql(file: str, output: OutputFormat, max_depth: int = 5, str
 
             # List tables
             if command == 'listtables':
-                tables = yql.db.con.execute("SHOW ALL TABLES;").fetchall()
+                tables = yql._db.con.execute("SHOW ALL TABLES;").fetchall()
                 if tables:
                     rich.print("[bold green]Available tables:[/bold green]")
                     for table in tables:
@@ -216,7 +216,7 @@ def run_interactive_sql(file: str, output: OutputFormat, max_depth: int = 5, str
                 
                 table_name = parts[1]
                 try:
-                    columns = yql.db.con.execute(f"PRAGMA table_info('{table_name}');").fetchall()
+                    columns = yql._db.con.execute(f"PRAGMA table_info('{table_name}');").fetchall()
                     if columns:
                         rich.print(f"[bold green]Fields for table '{table_name}':[/bold green]")
                         for col in columns:
@@ -319,10 +319,10 @@ def run_nlp(question: str, file: str, output: OutputFormat, mode: str = "r"):
         yql = YamlQL(file_path=file, mode=mode)
         
         schema_lines = []
-        for row in yql.db.con.execute("SHOW ALL TABLES;").fetchall():
+        for row in yql._db.con.execute("SHOW ALL TABLES;").fetchall():
             table_name = row[2]
             schema_lines.append(f"\n-- Table: {table_name}")
-            for col_info in yql.db.con.execute(f"PRAGMA table_info('{table_name}');").fetchall():
+            for col_info in yql._db.con.execute(f"PRAGMA table_info('{table_name}');").fetchall():
                 schema_lines.append(f"  - {col_info[1]}: {col_info[2]}")
         schema = "\n".join(schema_lines)
 

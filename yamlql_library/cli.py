@@ -141,11 +141,11 @@ def discover(
         rich.print(f"Discovered tables in [bold cyan]{file}[/bold cyan]:")
         
         # Use SHOW ALL TABLES to get all created tables from DuckDB
-        for row in yql.db.con.execute("SHOW ALL TABLES;").fetchall():
+        for row in yql._db.con.execute("SHOW ALL TABLES;").fetchall():
             table_name = row[2] # 'table_name' is the 3rd column
             panel_content = ""
             # Use PRAGMA to get column info
-            for col_info in yql.db.con.execute(f"PRAGMA table_info('{table_name}');").fetchall():
+            for col_info in yql._db.con.execute(f"PRAGMA table_info('{table_name}');").fetchall():
                 col_name = col_info[1]
                 col_type = col_info[2]
                 panel_content += f"  [bold]{col_name}[/bold]: {col_type}\n"

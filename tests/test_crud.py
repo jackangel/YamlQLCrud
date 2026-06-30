@@ -16,6 +16,7 @@ Each test uses isolated temporary files to ensure test independence.
 
 import pytest
 import pandas as pd
+import numpy as np
 from pathlib import Path
 from yamlql_library import YamlQL
 
@@ -128,7 +129,8 @@ def test_insert_integer_types(tmp_path):
     data = yql_read.query("SELECT * FROM numbers")
     assert len(data) == 1
     assert data.iloc[0]['value'] == 42
-    assert isinstance(data.iloc[0]['value'], (int, pd.Int64Dtype))
+    # Accept Python int, pandas Int64, or numpy integer types
+    assert isinstance(data.iloc[0]['value'], (int, pd.Int64Dtype)) or np.issubdtype(type(data.iloc[0]['value']), np.integer)
     yql.close()
     yql_read.close()
 

@@ -25,7 +25,7 @@ class YamlLoader:
         Returns:
             A dictionary representing the (potentially merged) YAML content.
         """
-        with open(self.file_path, 'r') as f:
+        with open(self.file_path, 'r', encoding='utf-8') as f:
             content = f.read()
 
         # Pre-process the content to handle common multi-document formatting issues

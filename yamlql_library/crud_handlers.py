@@ -1096,6 +1096,9 @@ class UpdateHandler:
                     # Strip "root." prefix for writer (same as DELETE handler)
                     writer_path = self._strip_root_prefix(target_path)
                     
+                    # Convert numpy types to Python native types for YAML serialization
+                    new_value = self._convert_numpy_types(new_value)
+                    
                     # Update the value in YAML
                     if writer_path:
                         writer.set_value(writer_path, new_value)
@@ -1191,6 +1194,29 @@ class UpdateHandler:
         else:
             # Path doesn't start with root (shouldn't happen, but handle gracefully)
             return yaml_path
+    
+    def _convert_numpy_types(self, value: Any) -> Any:
+        """
+        Convert numpy types to Python native types for YAML serialization.
+        
+        ruamel.yaml cannot serialize numpy types (np.int32, np.float64, etc.),
+        which are returned by DuckDB when evaluating expressions.
+        
+        Args:
+            value: Value to convert (may be numpy type or Python native)
+            
+        Returns:
+            Python native type equivalent
+            
+        Examples:
+            np.int32(42) → 42
+            np.float64(3.14) → 3.14
+            "string" → "string" (unchanged)
+        """
+        # Check if value has numpy item() method (indicates numpy scalar)
+        if hasattr(value, 'item'):
+            return value.item()  # Converts np.int32(42) → 42
+        return value
     
     def _update_database(
         self,

@@ -129,10 +129,16 @@ class DataTransformer:
                 return [self._stringify_scalar_lists(item) for item in data]
         return data
 
-    def _normalize_records(self, table_name: str, records: List[Dict], current_path: str = "root") -> List[Tuple[str, pd.DataFrame]]:
+    def _normalize_records(self, table_name: str, records: List[Dict], current_path: str = "root", is_actual_list: bool = True) -> List[Tuple[str, pd.DataFrame]]:
         """
         Normalizes a list of records into a primary DataFrame and extracts nested
         lists of objects into their own separate tables.
+        
+        Args:
+            table_name: Name for the resulting table
+            records: List of dictionary records to normalize
+            current_path: Current YAML path (e.g., "root.users")
+            is_actual_list: True if records came from an actual YAML list, False if from a wrapped dict
         """
         if not records:
             return []
@@ -141,11 +147,16 @@ class DataTransformer:
         records = self._stringify_scalar_lists(records)
         
         # Add _yaml_path to each record before processing
-        # Use index only if multiple records (indicating a list)
+        # For actual lists: Always include numeric index (e.g., "root.users.0", "root.users.1")
+        # For wrapped dicts: Use current_path as-is (e.g., "root.metadata")
         for i, record in enumerate(records):
-            if len(records) > 1:
+            if is_actual_list:
+                # List items always get indexed, even single-item lists
+                # This is required for UPDATE/DELETE operations to correctly locate list items
                 record['_yaml_path'] = f"{current_path}.{i}"
             else:
+                # Dict with scalars was wrapped in a list for processing
+                # Use the path as-is without index
                 record['_yaml_path'] = current_path
         
         # Extract nested lists of objects into their own tables first
@@ -182,7 +193,7 @@ class DataTransformer:
                 return
             if all(isinstance(item, dict) for item in node_value):
                 # Always use _normalize_records for lists of objects to get proper flattening
-                tables_list.extend(self._normalize_records(table_name, node_value, current_path))
+                tables_list.extend(self._normalize_records(table_name, node_value, current_path, is_actual_list=True))
             elif all(not isinstance(item, (dict, list)) for item in node_value):
                 df = pd.DataFrame({
                     'value': [str(x) for x in node_value],
@@ -214,7 +225,7 @@ class DataTransformer:
                     scalar_data[key] = value
 
             if scalar_data:
-                tables_list.extend(self._normalize_records(table_name, [scalar_data], current_path))
+                tables_list.extend(self._normalize_records(table_name, [scalar_data], current_path, is_actual_list=False))
 
             # Process nested dictionaries that qualified for their own tables
             for child_name, child_value in nested_dicts.items():
@@ -251,9 +262,13 @@ class DataTransformer:
         # (e.g., a single document wrapper), step inside it for a more intuitive schema.
         top_level_keys = list(data_copy.keys())
         if len(top_level_keys) == 1 and isinstance(data_copy[top_level_keys[0]], dict):
-            source_data = data_copy[top_level_keys[0]]
+            unwrapped_key = top_level_keys[0]
+            source_data = data_copy[unwrapped_key]
+            # CRITICAL: Preserve the unwrapped key in the path for correct _yaml_path generation
+            base_path = f"root.{unwrapped_key}"
         else:
             source_data = data_copy
+            base_path = "root"
 
         if isinstance(source_data, dict):
             # Check if this is a "record-like" dictionary (only scalar values)
@@ -262,11 +277,11 @@ class DataTransformer:
             
             if has_only_scalars:
                 # This is a single record - create a table with one row
-                all_tables.extend(self._normalize_records('data', [source_data], 'root'))
+                all_tables.extend(self._normalize_records('data', [source_data], base_path, is_actual_list=False))
             else:
                 # This has nested structures - process each item separately
                 for table_name, value in source_data.items():
-                    self._process_node(value, table_name, all_tables, depth=0, current_path=f"root.{table_name}")
+                    self._process_node(value, table_name, all_tables, depth=0, current_path=f"{base_path}.{table_name}")
         elif isinstance(source_data, list):
             self._process_node(source_data, 'root', all_tables, depth=0, current_path="root")
 

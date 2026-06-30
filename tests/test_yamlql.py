@@ -763,48 +763,49 @@ users:
     yql.close()
 
 def test_database_insert_raises_not_implemented(create_test_file):
-    """Test Task 1-4: Verify INSERT raises NotImplementedError with clear message."""
+    """Test Task 1-4: Verify INSERT raises PermissionError in read-only mode."""
     content = """
 users:
   - id: 1
     name: Alice
 """
     test_file = create_test_file("db_insert.yml", content)
-    yql = YamlQL(file_path=test_file)
+    yql = YamlQL(file_path=test_file)  # Read-only mode by default
     
-    # INSERT should raise NotImplementedError
-    with pytest.raises(NotImplementedError) as exc_info:
+    # INSERT should raise PermissionError in read-only mode
+    with pytest.raises(PermissionError) as exc_info:
         yql.query("INSERT INTO users (id, name) VALUES (2, 'Bob')")
     
     # Verify error message content
     error_message = str(exc_info.value)
     assert "INSERT" in error_message
-    assert "not yet supported" in error_message or "not supported" in error_message
+    assert "write mode" in error_message.lower()
     
     yql.close()
 
 def test_database_update_raises_not_implemented(create_test_file):
-    """Test Task 1-4: Verify UPDATE raises NotImplementedError."""
+    """Test Task 1-4: Verify UPDATE raises PermissionError in read-only mode."""
     content = """
 users:
   - id: 1
     name: Alice
 """
     test_file = create_test_file("db_update.yml", content)
-    yql = YamlQL(file_path=test_file)
+    yql = YamlQL(file_path=test_file)  # Read-only mode by default
     
-    # UPDATE should raise NotImplementedError
-    with pytest.raises(NotImplementedError) as exc_info:
+    # UPDATE should raise PermissionError in read-only mode
+    with pytest.raises(PermissionError) as exc_info:
         yql.query("UPDATE users SET name = 'Alicia' WHERE id = 1")
     
     # Verify error message mentions UPDATE
     error_message = str(exc_info.value)
     assert "UPDATE" in error_message
+    assert "write mode" in error_message.lower()
     
     yql.close()
 
 def test_database_delete_raises_not_implemented(create_test_file):
-    """Test Task 1-4: Verify DELETE raises NotImplementedError."""
+    """Test Task 1-4: Verify DELETE raises PermissionError in read-only mode."""
     content = """
 users:
   - id: 1
@@ -813,15 +814,16 @@ users:
     name: Bob
 """
     test_file = create_test_file("db_delete.yml", content)
-    yql = YamlQL(file_path=test_file)
+    yql = YamlQL(file_path=test_file)  # Read-only mode by default
     
-    # DELETE should raise NotImplementedError
-    with pytest.raises(NotImplementedError) as exc_info:
+    # DELETE should raise PermissionError in read-only mode
+    with pytest.raises(PermissionError) as exc_info:
         yql.query("DELETE FROM users WHERE id = 1")
     
     # Verify error message mentions DELETE
     error_message = str(exc_info.value)
     assert "DELETE" in error_message
+    assert "write mode" in error_message.lower()
     
     yql.close()
 
