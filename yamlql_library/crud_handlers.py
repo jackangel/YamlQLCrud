@@ -530,9 +530,11 @@ class InsertHandler:
         try:
             self.db.con.execute(insert_sql)
         except Exception as e:
-            # Log warning but don't fail - file write succeeded
-            import sys
-            print(f"Warning: Failed to update in-memory database: {e}", file=sys.stderr)
+            # Database sync failed - this is critical, must fail the operation
+            raise RuntimeError(
+                f"YAML file updated successfully, but failed to synchronize in-memory database: {e}. "
+                f"Reload the YamlQL instance to re-sync from file."
+            ) from e
     
     def _format_sql_value(self, value: Any) -> str:
         """
@@ -935,9 +937,19 @@ class UpdateHandler:
                 for col_name, new_value in set_clauses.items():
                     # Handle expressions (e.g., age = age + 1)
                     if isinstance(new_value, str) and new_value.startswith('__EXPR__'):
-                        # Extract current value from row and evaluate
-                        new_value = row[col_name]  # For now, use current value
-                        # TODO: Properly evaluate expressions via DuckDB
+                        # Extract expression from marker
+                        expr = new_value[8:]  # Remove '__EXPR__' prefix
+                        
+                        # Evaluate expression via DuckDB using current row values
+                        # Create a temporary single-row query to evaluate the expression
+                        eval_query = f"SELECT {expr} AS result FROM (VALUES ({', '.join([self._format_sql_value(row[c]) for c in row.index if c != '_yaml_path'])})) AS t({', '.join([c for c in row.index if c != '_yaml_path'])})"
+                        try:
+                            result_df = self.db.con.execute(eval_query).fetchdf()
+                            new_value = result_df.iloc[0]['result']
+                        except Exception as eval_error:
+                            raise ValueError(
+                                f"Failed to evaluate expression '{expr}' for column '{col_name}': {eval_error}"
+                            ) from eval_error
                     
                     # Convert column name to YAML path using reverse transformer
                     target_path = self._resolve_yaml_path(
@@ -1049,9 +1061,11 @@ class UpdateHandler:
         try:
             self.db.con.execute(update_sql)
         except Exception as e:
-            # Log warning but don't fail - file write succeeded
-            import sys
-            print(f"Warning: Failed to update in-memory database: {e}", file=sys.stderr)
+            # Database sync failed - this is critical, must fail the operation
+            raise RuntimeError(
+                f"YAML file updated successfully, but failed to synchronize in-memory database: {e}. "
+                f"Reload the YamlQL instance to re-sync from file."
+            ) from e
     
     def _format_sql_value(self, value: Any) -> str:
         """
@@ -1407,6 +1421,8 @@ class DeleteHandler:
         try:
             self.db.con.execute(delete_sql)
         except Exception as e:
-            # Log warning but don't fail - file write succeeded
-            import sys
-            print(f"Warning: Failed to update in-memory database: {e}", file=sys.stderr)
+            # Database sync failed - this is critical, must fail the operation
+            raise RuntimeError(
+                f"YAML file updated successfully, but failed to synchronize in-memory database: {e}. "
+                f"Reload the YamlQL instance to re-sync from file."
+            ) from e

@@ -275,7 +275,7 @@ def test_insert_read_only_mode_blocked(tmp_path):
     
     yql = YamlQL(str(yaml_file), mode='r')
     
-    with pytest.raises(PermissionError, match="Write operations not allowed in read-only mode"):
+    with pytest.raises(PermissionError, match="INSERT operations require write mode"):
         yql.query("INSERT INTO users (name) VALUES ('Alice')")
     
     yql.close()
@@ -635,7 +635,7 @@ users:
     
     yql = YamlQL(str(yaml_file), mode='r')
     
-    with pytest.raises(PermissionError, match="Write operations not allowed in read-only mode"):
+    with pytest.raises(PermissionError, match="UPDATE operations require write mode"):
         yql.query("UPDATE users SET age = 31 WHERE name = 'Alice'")
     
     yql.close()
@@ -1061,7 +1061,7 @@ users:
     
     yql = YamlQL(str(yaml_file), mode='r')
     
-    with pytest.raises(PermissionError, match="Write operations not allowed in read-only mode"):
+    with pytest.raises(PermissionError, match="DELETE operations require write mode"):
         yql.query("DELETE FROM users WHERE name = 'Alice'")
     
     yql.close()
