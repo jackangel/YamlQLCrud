@@ -168,6 +168,195 @@ yamlql sql -f config.yml "SELECT name FROM application"
 yamlql sql -f config.yml "SELECT name FROM application_features WHERE enabled = true"
 ```
 
+## CRUD Operations (Write Mode)
+
+**NEW:** YamlQL supports full CRUD operations! By default, YamlQL is **read-only** for safety. Enable write operations with the `--writable` flag.
+
+### INSERT: Adding New Data
+
+```bash
+# Add a new service to docker-compose.yml
+yamlql sql -f docker-compose.yml --writable \
+  "INSERT INTO services VALUES ('cache', 'redis:7', 6379)"
+
+# Add with explicit column names
+yamlql sql -f config.yml -w \
+  "INSERT INTO users (name, email, age) VALUES ('Alice', 'alice@example.com', 30)"
+
+# Add multiple rows at once
+yamlql sql -f config.yml -w \
+  "INSERT INTO users VALUES ('Bob', 25), ('Charlie', 35)"
+```
+
+**Result in YAML:**
+```yaml
+services:
+  - name: cache
+    image: redis:7
+    port: 6379
+
+users:
+  - name: Alice
+    email: alice@example.com
+    age: 30
+  - name: Bob
+    age: 25
+  - name: Charlie
+    age: 35
+```
+
+### UPDATE: Modifying Existing Data
+
+```bash
+# Update a single field
+yamlql sql -f config.yml -w \
+  "UPDATE users SET age = 31 WHERE name = 'Alice'"
+
+# Update multiple fields
+yamlql sql -f docker-compose.yml -w \
+  "UPDATE services SET image = 'redis:alpine', port = 6380 WHERE name = 'cache'"
+
+# Expression-based updates (increment, arithmetic)
+yamlql sql -f config.yml -w \
+  "UPDATE counters SET value = value + 1"
+
+# Update with complex WHERE clauses
+yamlql sql -f config.yml -w \
+  "UPDATE users SET status = 'inactive' WHERE age > 65 AND last_login < '2020-01-01'"
+```
+
+### DELETE: Removing Data
+
+```bash
+# Delete specific rows
+yamlql sql -f config.yml -w \
+  "DELETE FROM services WHERE status = 'deprecated'"
+
+# Pattern matching
+yamlql sql -f config.yml -w \
+  "DELETE FROM users WHERE email LIKE '%@temp.com'"
+
+# Delete with conditions
+yamlql sql -f docker-compose.yml -w \
+  "DELETE FROM services WHERE port < 1000 OR port > 9999"
+```
+
+⚠️ **Safety Note:** DELETE without WHERE is dangerous! YamlQL will prompt for confirmation.
+
+### Interactive Transaction Mode
+
+For batch operations, use interactive mode with transactions:
+
+```bash
+$ yamlql sql config.yml --interactive --writable
+YamlQL> begin
+✅ Transaction started
+
+YamlQL [TXN:0]> INSERT INTO services VALUES ('api', 8080);
+📝 Operation queued (transaction has 1 operations)
+
+YamlQL [TXN:1]> INSERT INTO services VALUES ('web', 3000);
+📝 Operation queued (transaction has 2 operations)
+
+YamlQL [TXN:2]> show pending
+Transaction has 2 pending operations:
+  1. INSERT INTO services VALUES ('api', 8080)
+  2. INSERT INTO services VALUES ('web', 3000)
+
+YamlQL [TXN:2]> commit
+✅ Transaction committed (2 operations executed)
+
+YamlQL> SELECT * FROM services;
++------+------+
+| name | port |
+|------+------|
+| api  | 8080 |
+| web  | 3000 |
++------+------+
+
+YamlQL> exit
+```
+
+**Transaction commands:**
+- `begin` - Start a transaction
+- `commit` - Execute all queued operations atomically
+- `rollback` - Discard all queued operations
+- `show pending` - List pending operations
+- `status` - Show mode and transaction state
+- `help` - Show all commands
+
+### Python API with Write Mode
+
+```python
+from yamlql_library import YamlQL
+
+# Read-only mode (default - safe)
+yql = YamlQL("config.yaml")
+data = yql.query("SELECT * FROM services")
+print(data)
+yql.close()
+
+# Write mode - explicit opt-in
+yql = YamlQL("config.yaml", mode="rw")
+
+# INSERT
+result = yql.query("INSERT INTO services VALUES ('api', 8080)")
+print(result['message'])  # "✅ 1 row inserted"
+
+# UPDATE
+result = yql.query("UPDATE services SET port = 8081 WHERE name = 'api'")
+print(result['message'])  # "✅ 1 row updated"
+
+# DELETE
+result = yql.query("DELETE FROM services WHERE name = 'old-service'")
+print(result['message'])  # "✅ 1 row deleted"
+
+yql.close()
+```
+
+### Safety Features
+
+YamlQL's write operations include multiple safety layers:
+
+✅ **Opt-in Model** - Write operations disabled by default  
+✅ **Atomic Operations** - All changes succeed or all fail (no partial updates)  
+✅ **Format Preservation** - Comments, indentation, and formatting maintained  
+✅ **Type Preservation** - Integer, boolean, string types preserved  
+✅ **Transaction Support** - Batch operations with commit/rollback  
+✅ **Automatic Backups** - Original file backed up before modifications  
+
+### Common CRUD Patterns
+
+**Configuration Management:**
+```bash
+# Add new environment
+yamlql sql -f config.yml -w \
+  "INSERT INTO environments VALUES ('staging', 'us-east-1', 't3.medium')"
+
+# Update resource allocations
+yamlql sql -f config.yml -w \
+  "UPDATE environments SET instance_type = 't3.large' WHERE name = 'production'"
+
+# Remove old environments
+yamlql sql -f config.yml -w \
+  "DELETE FROM environments WHERE name LIKE 'dev-%' AND last_used < '2024-01-01'"
+```
+
+**Service Management:**
+```bash
+# Scale services
+yamlql sql -f k8s-deployment.yml -w \
+  "UPDATE spec SET replicas = 5 WHERE environment = 'production'"
+
+# Update image versions
+yamlql sql -f docker-compose.yml -w \
+  "UPDATE services SET image = 'nginx:1.25' WHERE name = 'web'"
+```
+
+For complete documentation on CRUD operations, see:
+- [CRUD Operations Guide](../guides/crud-operations.md)
+- [Transaction Safety Guide](../guides/transaction-safety.md)
+
 ## Understanding Table Names
 
 YamlQL creates table names based on your YAML structure:

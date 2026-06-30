@@ -61,7 +61,114 @@ yamlql discover -f your-file.yaml
 
 # Query anything
 yamlql sql -f your-file.yaml "SELECT * FROM your_table"
+
+# Edit YAML with SQL (requires --writable flag)
+yamlql sql -f your-file.yaml --writable "UPDATE services SET replicas = 5 WHERE name = 'api'"
 ```
+
+## Full CRUD Operations
+
+**NEW:** YamlQL now supports full CRUD (Create, Read, Update, Delete) operations on YAML files! 🎉
+
+### Write Mode Safety
+
+By default, YamlQL is **read-only** for safety. Enable write operations explicitly:
+
+```bash
+# Read-only (default)
+yamlql sql -f config.yaml "SELECT * FROM services"
+
+# Write mode - use --writable flag
+yamlql sql -f config.yaml --writable "INSERT INTO services VALUES ('api', 8080)"
+yamlql sql -f config.yaml -w "UPDATE services SET port = 8081 WHERE name = 'api'"
+```
+
+### INSERT: Add New Data
+
+```bash
+# Add a new service
+yamlql sql -f docker-compose.yaml --writable \
+  "INSERT INTO services VALUES ('cache', 'redis:7', 6379)"
+
+# Result in YAML:
+# services:
+#   - name: cache
+#     image: redis:7
+#     port: 6379
+```
+
+### UPDATE: Modify Existing Data
+
+```bash
+# Update a single field
+yamlql sql -f config.yaml -w "UPDATE users SET age = 31 WHERE name = 'Alice'"
+
+# Update multiple fields
+yamlql sql -f config.yaml -w \
+  "UPDATE services SET replicas = 5, status = 'active' WHERE environment = 'prod'"
+
+# Expression-based updates
+yamlql sql -f config.yaml -w "UPDATE counters SET value = value + 1"
+```
+
+### DELETE: Remove Data
+
+```bash
+# Delete specific rows
+yamlql sql -f config.yaml -w "DELETE FROM services WHERE status = 'deprecated'"
+
+# Pattern matching
+yamlql sql -f config.yaml -w "DELETE FROM users WHERE email LIKE '%@temp.com'"
+```
+
+### Interactive Transaction Mode
+
+For batch operations, use interactive mode with transactions:
+
+```bash
+$ yamlql sql config.yaml --interactive --writable
+YamlQL> begin
+✅ Transaction started
+
+YamlQL [TXN:0]> INSERT INTO services VALUES ('api', 8080);
+YamlQL [TXN:1]> INSERT INTO services VALUES ('web', 3000);
+YamlQL [TXN:2]> UPDATE services SET status = 'active';
+
+YamlQL [TXN:3]> commit
+✅ Transaction committed (3 operations executed)
+```
+
+**Transaction commands:**
+- `begin` - Start transaction
+- `commit` - Apply all changes atomically
+- `rollback` - Discard pending changes
+- `show pending` - List queued operations
+- `status` - Show connection state
+
+### Python API with Write Mode
+
+```python
+from yamlql_library import YamlQL
+
+# Read-only mode (default)
+yql = YamlQL("config.yaml")
+data = yql.query("SELECT * FROM services")
+
+# Write mode
+yql = YamlQL("config.yaml", mode="rw")
+result = yql.query("INSERT INTO services VALUES ('api', 8080)")
+print(result['message'])  # "✅ 1 row inserted"
+yql.close()
+```
+
+**Safety Features:**
+- ✅ Atomic operations (all-or-nothing)
+- ✅ Automatic backups before changes
+- ✅ Format preservation (comments, indentation)
+- ✅ Type preservation (int, bool, string)
+- ✅ Transaction support with rollback
+
+See the [CRUD Operations Guide](docs/guides/crud-operations.md) for complete documentation.
 
 ## Real-World Examples
 
