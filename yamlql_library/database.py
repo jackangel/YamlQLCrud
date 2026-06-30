@@ -6,10 +6,17 @@ from .sql_interceptor import SqlInterceptor
 class Database:
     """Manages an in-memory DuckDB database."""
 
-    def __init__(self):
-        """Initializes a new in-memory DuckDB connection."""
+    def __init__(self, mode: str = 'r', file_path: str = None):
+        """Initializes a new in-memory DuckDB connection.
+        
+        Args:
+            mode: File mode ('r' for read-only, 'rw' or 'w' for read-write).
+            file_path: Path to the YAML file (for write operations).
+        """
         self.con = duckdb.connect(database=':memory:')
         self.interceptor = SqlInterceptor()
+        self.mode = mode
+        self.file_path = file_path
 
     def create_tables(self, tables: List[Tuple[str, pd.DataFrame]]):
         """
