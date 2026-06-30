@@ -66,9 +66,8 @@ class ReverseTransformer:
             if col_name == '_yaml_path':
                 continue
             
-            # Skip null values (pandas NaN/None)
-            if pd.isna(value):
-                continue
+            # NOTE: We DO NOT skip null values - they should be written as YAML null
+            # to preserve schema and allow SELECT to return null columns
             
             # Look up original column name from the mapping
             # The mapping tells us the exact original key before sanitization
@@ -83,7 +82,7 @@ class ReverseTransformer:
             # (e.g., "metadata.name" not "metadata_name")
             yaml_path = original_col
             
-            # Store the path→value pair
+            # Store the path→value pair (including None/NaN values)
             path_value_pairs[yaml_path] = value
         
         return path_value_pairs
