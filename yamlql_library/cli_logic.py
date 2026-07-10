@@ -19,20 +19,30 @@ def run_query(sql_query: str, file: str, output: OutputFormat, max_depth: int = 
         yql = YamlQL(file_path=file, max_depth=max_depth, strategy=strategy, mode=mode)
         results = yql.query(sql_query)
 
-        if results.empty:
-            rich.print("[yellow]Query returned no results.[/yellow]")
-            return
-        
-        console = Console()
-        use_list_view = (
-            output == OutputFormat.LIST or
-            (output == OutputFormat.AUTO and _get_required_table_width(results) > console.width)
-        )
+        # Handle DataFrame results (SELECT queries)
+        if hasattr(results, 'empty'):
+            if results.empty:
+                rich.print("[yellow]Query returned no results.[/yellow]")
+                return
+            
+            console = Console()
+            use_list_view = (
+                output == OutputFormat.LIST or
+                (output == OutputFormat.AUTO and _get_required_table_width(results) > console.width)
+            )
 
-        if use_list_view:
-            _render_list(results)
-        else:
-            _render_table(results)
+            if use_list_view:
+                _render_list(results)
+            else:
+                _render_table(results)
+        # Handle dict results (INSERT/UPDATE/DELETE)
+        elif isinstance(results, dict):
+            if results.get('success'):
+                message = results.get('message', 'Operation completed')
+                rich.print(f"[green]✓ {message}[/green]")
+            else:
+                error = results.get('error', 'Unknown error')
+                rich.print(f"[red]✗ {error}[/red]")
 
     except FileNotFoundError as e:
         rich.print(f"[bold red]Error:[/bold red] {e}")
@@ -335,21 +345,31 @@ def run_nlp(question: str, file: str, output: OutputFormat, mode: str = "r"):
 
         results = yql.query(sql_query)
 
-        if results.empty:
-            rich.print("[yellow]Query executed successfully and returned no results.[/yellow]")
-            return
+        # Handle DataFrame results (SELECT queries)
+        if hasattr(results, 'empty'):
+            if results.empty:
+                rich.print("[yellow]Query executed successfully and returned no results.[/yellow]")
+                return
 
-        rich.print("\n[bold magenta]Query Results:[/bold magenta]")
-        console = Console()
-        use_list_view = (
-            output == OutputFormat.LIST or
-            (output == OutputFormat.AUTO and _get_required_table_width(results) > console.width)
-        )
+            rich.print("\n[bold magenta]Query Results:[/bold magenta]")
+            console = Console()
+            use_list_view = (
+                output == OutputFormat.LIST or
+                (output == OutputFormat.AUTO and _get_required_table_width(results) > console.width)
+            )
 
-        if use_list_view:
-            _render_list(results)
-        else:
-            _render_table(results)
+            if use_list_view:
+                _render_list(results)
+            else:
+                _render_table(results)
+        # Handle dict results (INSERT/UPDATE/DELETE)
+        elif isinstance(results, dict):
+            if results.get('success'):
+                message = results.get('message', 'Operation completed')
+                rich.print(f"[green]✓ {message}[/green]")
+            else:
+                error = results.get('error', 'Unknown error')
+                rich.print(f"[red]✗ {error}[/red]")
 
     except (ValueError, NotImplementedError) as e:
         rich.print(f"[bold red]Configuration Error:[/bold red] {e}")

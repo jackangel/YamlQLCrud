@@ -1,0 +1,17 @@
+users:
+- name: Alice
+  age: 31
+  email: alice@example.com
+  status: inactive
+- name: Bob
+  age: 25
+  email: bob@example.com
+  status: active
+- name: Diana
+  age: 28
+  email: diana@example.com
+  status: active
+- name: Eve
+  age: 40
+  email: eve@example.com
+  status: inactive
