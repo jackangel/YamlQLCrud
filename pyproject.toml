@@ -41,7 +41,7 @@ nlp = [
 ]
 
 [project.scripts]
-yamlql = "yamlql_library.cli:app"
+yamlql = "yamlql_library.cli:main"
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel", "build"]

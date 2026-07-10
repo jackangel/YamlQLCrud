@@ -187,5 +187,9 @@ def ai_command(
     mode = "rw" if writable else "r"
     cli_logic.run_nlp(question, file, output, mode)
 
+def main():
+    """Entry point for the console script."""
+    app()
+
 if __name__ == "__main__":
-    app() 
+    main() 
