@@ -390,6 +390,44 @@ def test_cli_sql_from_file_option(create_test_file):
     assert result.exit_code == 0
     assert "cli_user" in result.stdout
 
+def test_cli_sql_from_file_option_unicode(tmp_path):
+    """AC-3/AC-4 regression test: '--sql-file' with a UTF-8-encoded SQL file
+    containing non-ASCII (Chinese) string literals must execute correctly
+    with no corruption (regression guard for the cli.py:111 encoding bug),
+    and the resulting value must print correctly to stdout on a subsequent
+    query (AC-4)."""
+    yaml_file = tmp_path / "cli_test_unicode.yml"
+    yaml_file.write_text("users: []", encoding="utf-8")
+
+    insert_sql_file = tmp_path / "insert_query.sql"
+    insert_sql_file.write_text(
+        "INSERT INTO users (id, name) VALUES (1, '你好世界')", encoding="utf-8"
+    )
+
+    insert_result = runner.invoke(
+        app, ["sql", "-f", str(yaml_file), "--sql-file", str(insert_sql_file), "--writable"]
+    )
+    assert insert_result.exit_code == 0
+
+    # Reload directly from disk to confirm the write-back preserved the
+    # exact Chinese characters (verifies the SQL file was read as UTF-8,
+    # not mis-decoded, before being passed to the query engine).
+    yql_read = YamlQL(str(yaml_file))
+    data = yql_read.query("SELECT * FROM users")
+    assert data.iloc[0]['name'] == '你好世界'
+    yql_read.close()
+
+    # AC-4: query the value back out via --sql-file and verify it prints
+    # correctly to captured stdout with no UnicodeEncodeError/UnicodeDecodeError.
+    select_sql_file = tmp_path / "select_query.sql"
+    select_sql_file.write_text("SELECT name FROM users WHERE id = 1", encoding="utf-8")
+
+    select_result = runner.invoke(
+        app, ["sql", "-f", str(yaml_file), "--sql-file", str(select_sql_file)]
+    )
+    assert select_result.exit_code == 0
+    assert "你好世界" in select_result.stdout
+
 def test_cli_sql_without_quotes(create_test_file):
     """Test that a simple SQL query can be run without quotes."""
     yaml_content = "users:\n  - name: no_quotes_user"

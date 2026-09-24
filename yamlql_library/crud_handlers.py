@@ -48,7 +48,7 @@ class InsertHandler:
         file_path: str,
         column_name_map: Dict[str, Dict[str, str]],
         original_data: dict,
-        db: Database
+        db: "Database"
     ):
         """
         Initialize the INSERT handler.
@@ -712,7 +712,7 @@ class UpdateHandler:
         file_path: str,
         column_name_map: Dict[str, Dict[str, str]],
         original_data: dict,
-        db: Database
+        db: "Database"
     ):
         """
         Initialize the UPDATE handler.
@@ -1319,7 +1319,7 @@ class DeleteHandler:
         file_path: str,
         column_name_map: Dict[str, Dict[str, str]],
         original_data: dict,
-        db: Database
+        db: "Database"
     ):
         """
         Initialize the DELETE handler.

@@ -1,0 +1,7 @@
+people:
+  - id: 1
+    name: "张伟"
+    greeting: "你好，世界"
+  - id: 2
+    name: "李娜"
+    greeting: "欢迎来到北京"

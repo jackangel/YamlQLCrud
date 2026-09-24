@@ -18,7 +18,6 @@ import typer
 import rich
 import rich.panel
 from . import YamlQL
-from .llm_providers import get_llm_provider
 from . import cli_logic
 from .utils import OutputFormat
 
@@ -67,19 +66,12 @@ def main(
     # If --execute is used, run the query and exit.
     if execute:
         file_env = os.environ.get("YAMLQL_FILE")
-        mode = (os.environ.get("YAMLQL_MODE") or "SQL").upper()
 
         if not file_env:
             rich.print("[bold red]Error:[/bold red] The --execute/-e flag requires the YAMLQL_FILE environment variable to be set.", file=sys.stderr)
             raise typer.Exit(code=1)
 
-        if mode == "SQL":
-            cli_logic.run_query(execute, file_env, OutputFormat.AUTO)
-        elif mode == "AI":
-            cli_logic.run_nlp(execute, file_env, OutputFormat.AUTO)
-        else:
-            rich.print("[bold red]Error:[/bold red] Invalid YAMLQL_MODE set. Use SQL or AI.", file=sys.stderr)
-            raise typer.Exit(code=1)
+        cli_logic.run_query(execute, file_env, OutputFormat.AUTO)
         raise typer.Exit()
 
     # If nothing is provided, show help
@@ -116,7 +108,7 @@ def sql_command(
     mode = "rw" if writable else "r"
     
     if sql_file:
-        with open(sql_file, 'r') as f:
+        with open(sql_file, 'r', encoding='utf-8') as f:
             sql_query_str = f.read().strip()
         cli_logic.run_query(sql_query_str, file, output, max_depth, strategy, mode)
     elif sql_query:
@@ -162,32 +154,6 @@ def discover(
     finally:
         if 'yql' in locals() and yql:
             yql.close()
-
-@app.command(name="ai")
-def ai_command(
-    question: str = typer.Argument(..., help="The natural language question to ask about the YAML file."),
-    file: str = typer.Option(..., "--file", "-f", help="Path to the YAML file to query.", envvar="YAMLQL_FILE"),
-    output: OutputFormat = typer.Option(
-        OutputFormat.AUTO, 
-        "--output", 
-        "-o", 
-        help="Output format.",
-        envvar="YAMLQL_OUTPUT"
-    ),
-    writable: bool = typer.Option(False, "--writable", "-w", help="Enable write operations (INSERT/UPDATE/DELETE).")
-):
-    """
-    Answers a natural language question about a YAML file by generating and executing a SQL query.
-    Requires environment variables for the chosen LLM provider (e.g., YAMLQL_LLM_PROVIDER and OPENAI_API_KEY).
-    
-    By default, only read operations (SELECT) are allowed.
-    Use --writable flag to enable write operations.
-    """
-    if writable:
-        rich.print("[yellow]⚠ Write mode enabled. Changes will be saved to the file.[/yellow]")
-    
-    mode = "rw" if writable else "r"
-    cli_logic.run_nlp(question, file, output, mode)
 
 def main():
     """Entry point for the console script."""

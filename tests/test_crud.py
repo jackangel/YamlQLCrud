@@ -1543,6 +1543,46 @@ def test_crud_unicode_content(tmp_path):
     yql.close()
 
 
+def test_load_static_unicode_fixture_roundtrip(tmp_path):
+    """AC-1/AC-6 regression test: load a pre-existing on-disk UTF-8 YAML
+    fixture containing Chinese-character data (not SQL-inserted), query it,
+    then UPDATE + write-back + reload and verify fidelity through the full
+    load -> query -> write-back -> reload cycle."""
+    fixture_path = Path(__file__).parent / "test_data" / "unicode_sample.yaml"
+    yaml_file = tmp_path / "unicode_sample.yaml"
+    yaml_file.write_text(fixture_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    # AC-1: load pre-existing on-disk UTF-8 fixture and query it exactly.
+    yql = YamlQL(str(yaml_file))
+    data = yql.query("SELECT * FROM people ORDER BY id")
+    assert len(data) == 2
+    assert data.iloc[0]['name'] == '张伟'
+    assert data.iloc[0]['greeting'] == '你好，世界'
+    assert data.iloc[1]['name'] == '李娜'
+    assert data.iloc[1]['greeting'] == '欢迎来到北京'
+    yql.close()
+
+    # AC-6: UPDATE with new non-ASCII content, write back, reload, verify.
+    yql_rw = YamlQL(str(yaml_file), mode='rw')
+    yql_rw.query("UPDATE people SET greeting = '早上好，中国' WHERE id = 1")
+    yql_rw.close()
+
+    yql_reload = YamlQL(str(yaml_file))
+    data_reload = yql_reload.query("SELECT * FROM people ORDER BY id")
+    assert data_reload.iloc[0]['greeting'] == '早上好，中国'
+    # Untouched row's original fixture content must survive the round-trip.
+    assert data_reload.iloc[1]['name'] == '李娜'
+    assert data_reload.iloc[1]['greeting'] == '欢迎来到北京'
+    yql_reload.close()
+
+    # Byte-level check: file on disk still contains exact Chinese substrings,
+    # no \uXXXX escaping introduced by write-back.
+    raw = yaml_file.read_text(encoding="utf-8")
+    assert '早上好，中国' in raw
+    assert '李娜' in raw
+    assert '\\u' not in raw
+
+
 def test_crud_preserves_unmodified_sections(tmp_path):
     """CRUD on one section doesn't affect other sections."""
     yaml_file = tmp_path / "sections.yaml"
