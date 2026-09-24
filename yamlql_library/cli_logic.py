@@ -304,7 +304,9 @@ def run_interactive_sql(file: str, output: OutputFormat, max_depth: int = 5, str
     except FileNotFoundError as e:
         rich.print(f"[bold red]Error:[/bold red] {e}")
     except Exception as e:
+        import traceback
         rich.print(f"[bold red]An unexpected error occurred:[/bold red] {e}")
+        rich.print(f"[dim]{traceback.format_exc()}[/dim]")
     finally:
         if yql:
             yql.close()
@@ -376,7 +378,9 @@ def run_nlp(question: str, file: str, output: OutputFormat, mode: str = "r"):
     except FileNotFoundError as e:
         rich.print(f"[bold red]Error:[/bold red] {e}")
     except Exception as e:
+        import traceback
         rich.print(f"[bold red]An unexpected error occurred:[/bold red] {e}")
+        rich.print(f"[dim]{traceback.format_exc()}[/dim]")
     finally:
         if yql:
             yql.close() 

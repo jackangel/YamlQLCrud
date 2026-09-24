@@ -1,8 +1,40 @@
 from abc import ABC, abstractmethod
 import os
 import openai
-import google.generativeai as genai
 import re
+import warnings
+
+# Suppress the google.generativeai deprecation warning
+warnings.filterwarnings("ignore", category=FutureWarning, module="google.generativeai")
+
+# Lazy import for Google Genai to avoid import-time warnings
+_genai_module = None
+_GENAI_AVAILABLE = False
+_USING_LEGACY_GENAI = False
+
+def _get_genai():
+    """Lazy import Google Genai with fallback to legacy API."""
+    global _genai_module, _GENAI_AVAILABLE, _USING_LEGACY_GENAI
+    
+    if _genai_module is not None:
+        return _genai_module
+    
+    try:
+        from google import genai
+        _genai_module = genai
+        _GENAI_AVAILABLE = True
+        _USING_LEGACY_GENAI = False
+    except ImportError:
+        try:
+            import google.generativeai as genai
+            _genai_module = genai
+            _GENAI_AVAILABLE = True
+            _USING_LEGACY_GENAI = True
+        except ImportError:
+            _GENAI_AVAILABLE = False
+            _USING_LEGACY_GENAI = False
+    
+    return _genai_module
 
 # --- Base Provider ---
 
@@ -67,16 +99,50 @@ class OpenAiProvider(LlmProvider):
 class GeminiProvider(LlmProvider):
     """Provider for Google's Gemini models."""
     def __init__(self):
+        genai = _get_genai()
+        
+        if genai is None:
+            raise ValueError(
+                "Google Genai package not installed. "
+                "Install with: pip install google-genai"
+            )
+        
         self.api_key = os.getenv("GEMINI_API_KEY")
         if not self.api_key:
             raise ValueError("GEMINI_API_KEY environment variable not set.")
-        genai.configure(api_key=self.api_key)
-        self.model = genai.GenerativeModel('gemini-2.0-flash')
+        
+        # Try new google.genai API first, fall back to legacy if needed
+        if not _USING_LEGACY_GENAI:
+            try:
+                # New google.genai API
+                self.client = genai.Client(api_key=self.api_key)
+                self.use_legacy = False
+            except (AttributeError, TypeError):
+                # Fall back to legacy if new API structure is different
+                genai.configure(api_key=self.api_key)
+                self.model = genai.GenerativeModel('gemini-2.0-flash')
+                self.use_legacy = True
+        else:
+            # Legacy google.generativeai API
+            genai.configure(api_key=self.api_key)
+            self.model = genai.GenerativeModel('gemini-2.0-flash')
+            self.use_legacy = True
 
     def get_sql_query(self, schema: str, question: str) -> str:
         prompt = self._build_prompt(schema, question)
-        response = self.model.generate_content(prompt)
-        raw_sql = response.text.strip()
+        
+        if self.use_legacy:
+            # Legacy API
+            response = self.model.generate_content(prompt)
+            raw_sql = response.text.strip()
+        else:
+            # New API
+            response = self.client.models.generate_content(
+                model='gemini-2.0-flash',
+                contents=prompt
+            )
+            raw_sql = response.text.strip()
+        
         return self._sanitize_sql(raw_sql)
 
 # --- Factory Function ---

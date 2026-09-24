@@ -67,8 +67,21 @@ class DataTransformer:
         
         find_paths(records[0])
 
+        # Helper function to check if a record has a nested path
+        def has_path(record, path):
+            """Check if a record has the given nested path."""
+            current = record
+            for key in path:
+                if not isinstance(current, dict) or key not in current:
+                    return False
+                current = current[key]
+            return True
+
         # For each path, create a new table from the nested lists across all records
         for path in paths_to_extract:
+            # Only extract paths that exist in ALL records
+            if not all(has_path(record, path) for record in records):
+                continue  # Skip this path if not all records have it
             nested_table_name = f"{parent_table_name}_{'_'.join(path)}".replace('-', '_')
             
             # Extract parent metadata for joining (include _yaml_path if present)

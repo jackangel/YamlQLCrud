@@ -156,7 +156,9 @@ def discover(
     except FileNotFoundError as e:
         rich.print(f"[bold red]Error:[/bold red] {e}")
     except Exception as e:
+        import traceback
         rich.print(f"[bold red]An unexpected error occurred:[/bold red] {e}")
+        rich.print(f"[dim]{traceback.format_exc()}[/dim]")
     finally:
         if 'yql' in locals() and yql:
             yql.close()
