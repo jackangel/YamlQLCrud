@@ -108,7 +108,7 @@ def sql_command(
     mode = "rw" if writable else "r"
     
     if sql_file:
-        with open(sql_file, 'r', encoding='utf-8') as f:
+        with open(sql_file, 'r') as f:
             sql_query_str = f.read().strip()
         cli_logic.run_query(sql_query_str, file, output, max_depth, strategy, mode)
     elif sql_query:
