@@ -3,6 +3,42 @@ from pathlib import Path
 from typing import Any, Dict
 import re
 
+
+class _ApplicationTagSafeLoader(yaml.SafeLoader):
+    """SafeLoader variant that accepts application-defined YAML tags."""
+
+
+def _construct_application_tag(
+    loader: yaml.SafeLoader, tag_suffix: str, node: yaml.nodes.Node
+) -> Any:
+    """Construct the plain value behind an application-defined tag."""
+    if node.tag.startswith("tag:yaml.org,2002:"):
+        # Never allow PyYAML's Python-object tag family through this fallback.
+        raise yaml.constructor.ConstructorError(
+            None,
+            None,
+            f"could not determine a constructor for the tag {node.tag!r}",
+            node.start_mark,
+        )
+
+    if isinstance(node, yaml.ScalarNode):
+        return loader.construct_scalar(node)
+    if isinstance(node, yaml.SequenceNode):
+        return loader.construct_sequence(node, deep=True)
+    if isinstance(node, yaml.MappingNode):
+        return loader.construct_mapping(node, deep=True)
+
+    raise yaml.constructor.ConstructorError(
+        None,
+        None,
+        f"could not determine a constructor for the tag {node.tag!r}",
+        node.start_mark,
+    )
+
+
+_ApplicationTagSafeLoader.add_multi_constructor("", _construct_application_tag)
+
+
 class YamlLoader:
     """Loads content from a YAML file, with support for multi-document streams."""
 
@@ -39,8 +75,8 @@ class YamlLoader:
             # This regex finds keys at the start of a line and wraps them in quotes.
             processed_content = re.sub(f'^{key}:', f'"{key}":', processed_content, flags=re.MULTILINE)
 
-        # Use safe_load_all to handle multi-document YAML files
-        documents = list(yaml.safe_load_all(processed_content))
+        # Use the dedicated safe loader to handle multi-document YAML files.
+        documents = list(yaml.load_all(processed_content, Loader=_ApplicationTagSafeLoader))
 
         if not documents:
             return {}

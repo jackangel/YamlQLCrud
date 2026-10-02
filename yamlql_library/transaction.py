@@ -138,6 +138,9 @@ class TransactionManager:
         
         Writes changes to a temporary file, validates the YAML, then atomically
         replaces the original file. The backup is cleaned up on success.
+
+        If the writer was not loaded, the commit is empty: no source file is
+        written and the temporary and backup files are removed.
         
         The atomic write sequence:
         1. Write changes to temp file (config.yaml.tmp)
@@ -168,15 +171,46 @@ class TransactionManager:
             )
             os.close(fd)  # Close the file descriptor, we'll use the path
             self.temp_path = Path(temp_path)
+
+            # An unloaded writer has no YAML data to serialize. Complete the
+            # transaction without touching the source file.
+            if not self.writer._is_loaded:
+                self.temp_path.unlink()
+                if self.backup_path.exists():
+                    self.backup_path.unlink()
+                self.state = TransactionState.COMMITTED
+                self.temp_path = None
+                return
             
-            # Write changes to temp file via YamlWriter
-            temp_writer = YamlWriter(str(self.temp_path))
-            temp_writer.data = self.writer.data
-            temp_writer._is_loaded = True
-            temp_writer.write()
+            # Some CRUD handlers append directly to the round-trip object.
+            # Detect those mutations so write_to() renders instead of returning
+            # the original source bytes for an otherwise clean writer.
+            if not self.writer._is_dirty:
+                from ruamel.yaml import YAML
+
+                source_documents = list(
+                    YAML().load_all(self.backup_path.read_text(encoding='utf-8-sig'))
+                )
+                if self.writer.documents != source_documents:
+                    self.writer._is_dirty = True
+                    self.writer._source_matches_data = False
+                    if len(self.writer.documents) != len(source_documents):
+                        self.writer._dirty_documents.update(
+                            range(len(self.writer.documents))
+                        )
+                    else:
+                        self.writer._dirty_documents.update(
+                            index
+                            for index, document in enumerate(self.writer.documents)
+                            if document != source_documents[index]
+                        )
+
+            # Write through the transaction writer to retain its format profile.
+            self.writer.write_to(self.temp_path)
             
-            # Validate temp file is valid YAML by attempting to load it
-            self._validate_yaml(self.temp_path)
+            # Validate every document in the serialized stream and ensure no
+            # document was lost or merged during rendering.
+            self._validate_yaml(self.temp_path, self.writer.doc_count)
             
             # Atomic replace: os.replace works on both POSIX and Windows
             # On Windows, this requires the destination to not be open by another process
@@ -248,12 +282,18 @@ class TransactionManager:
             'writer_loaded': self.writer._is_loaded if self.writer else False,
         }
     
-    def _validate_yaml(self, file_path: Path) -> None:
+    def _validate_yaml(
+        self,
+        file_path: Path,
+        expected_documents: Optional[int] = None,
+    ) -> None:
         """
         Validate that a file contains valid YAML.
         
         Args:
             file_path: Path to the file to validate
+            expected_documents: Expected number of documents in the stream.
+                When omitted, the file is parsed without a count assertion.
             
         Raises:
             ValueError: If the file is not valid YAML
@@ -263,7 +303,12 @@ class TransactionManager:
         try:
             yaml = YAML()
             with open(file_path, 'r', encoding='utf-8') as f:
-                yaml.load(f)
+                documents = list(yaml.load_all(f))
+            if expected_documents is not None and len(documents) != expected_documents:
+                raise ValueError(
+                    "Document count mismatch: "
+                    f"expected {expected_documents}, parsed {len(documents)}"
+                )
         except Exception as e:
             raise ValueError(f"Invalid YAML in temp file: {e}")
     

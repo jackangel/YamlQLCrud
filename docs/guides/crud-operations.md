@@ -129,6 +129,19 @@ UPDATE users SET tier = 'premium' WHERE name IN ('Alice', 'Bob', 'Charlie')
 UPDATE products SET discount = 0.2 WHERE price BETWEEN 100 AND 500
 ```
 
+### Structural-change guard
+
+An SQL `UPDATE` cannot replace a mapping or sequence with a scalar (including
+`NULL`), or replace a scalar with a mapping or sequence. The statement fails
+before the file is committed. The underlying writer error has this exact shape:
+
+```text
+Refusing to change node at '<path>' from <kind> to <kind> (<PythonType>); pass allow_kind_change=True to override
+```
+
+There is no SQL opt-in for this. Python users of `YamlWriter` can explicitly
+pass `allow_kind_change=True`; SQL users must make a shape-compatible update.
+
 ## DELETE Operations
 
 ### Basic DELETE
@@ -230,6 +243,10 @@ YamlQL> exit
 - `show pending` - List queued operations
 - `status` - Show connection and transaction state
 
+`BEGIN` queues statements, but `COMMIT` executes them one at a time. It is not
+one atomic multi-statement file transaction: an earlier statement can remain
+committed if a later statement fails.
+
 ## Safety Features
 
 ### 1. Opt-In Model
@@ -250,17 +267,27 @@ $ yamlql sql data.yaml --writable "INSERT INTO users VALUES ('Alice', 30)"
 
 All write operations are atomic - either they fully succeed or fully fail with no partial changes.
 
-### 3. Format Preservation
-
-YamlQL preserves:
-- Comments in YAML files
-- Indentation and formatting
-- Key ordering
-- Multi-line strings
-
 ### 4. Backup on Errors
 
-If an operation fails mid-transaction, changes are automatically rolled back to the original state.
+Each SQL write statement uses a backup, a same-directory temporary file,
+stream validation, and atomic replacement. The tested rejection cases leave
+the source bytes unchanged.
+
+## Tested write fidelity and edit policies
+
+These guarantees apply to the covered writer and SQL CRUD cases; they are not
+a claim that arbitrary YAML source syntax is preserved unchanged.
+
+| Area | Tested behavior |
+| --- | --- |
+| Physical layout | Edits retain LF or CRLF, UTF-8 BOM, trailing-newline suffixes, detected indentation, and the dominant indentation style in a mixed file. |
+| Scalars and collections | Existing single/double quotes and block-scalar indicator/chomping are retained on string updates. Existing flow collections stay flow; new values adopt tested local sibling/row styles. Numeric and boolean literal spelling is not guaranteed after an update. |
+| Comments | A comment block directly above an item with no blank line, and that item's end-of-line comment, are deleted with the item. Blank-line-separated blocks and comments before the next top-level key remain. |
+| Anchors and aliases | Updating an anchored definition retains its anchor and updates aliases. Updating an alias occurrence replaces only that occurrence with a literal. Deleting an anchor still referenced by aliases is rejected. |
+| Merge keys and tags | Setting an inherited merge-only key adds an own-key override; deleting that merge-only key is rejected. Tested custom tags, including `!Ref`, remain readable on the SQL read path and remain intact when another node is updated. |
+| Document streams | Writer edits preserve untouched documents. An unqualified path targets the last mapping document defining its top-level key; non-mapping documents are preserved by the writer but are not SQL-addressable. |
+
+No rename, move, or set-comment SQL/Python editing APIs are provided.
 
 ## Common Patterns
 
@@ -310,23 +337,19 @@ INSERT INTO logs VALUES ('2024-01-03', 'Data updated')
 COMMIT
 ```
 
-## Limitations
+## Limits of the SQL model
 
-1. **In-Memory Sync**: After write operations, query the file with a new YamlQL instance for guaranteed fresh data:
-
-```python
-yql = YamlQL("data.yaml", mode="rw")
-yql.query("INSERT INTO users VALUES ('Alice', 30)")
-
-# For guaranteed fresh data, reload
-yql.close()
-yql = YamlQL("data.yaml")
-data = yql.query("SELECT * FROM users")
-```
-
-2. **Complex Expressions**: Some advanced SQL expressions in UPDATE may not be supported. Test with your specific use case.
-
-3. **Foreign Keys**: YamlQL doesn't enforce referential integrity. Deleting parent records doesn't cascade to children.
+- The SQL read model is lossy: mapping-valued fields are flattened into
+  columns, so a mapping-valued field cannot be set to a scalar through SQL.
+  Mapping documents are shallow-merged on read; document boundaries and
+  non-mapping documents are not represented by SQL.
+- SQL column names can collide after sanitization. Dots and numeric segments
+  in YAML keys are ambiguous in dot paths.
+- Only top-level-key tables are addressed for `INSERT`; root-level lists in
+  multi-document files are not SQL-addressable.
+- There is no concurrency control. Atomic replacement prevents torn files,
+  not lost updates between writers.
+- The writer uses ruamel.yaml internals verified with version 0.19.1.
 
 ## Error Handling
 
@@ -350,7 +373,7 @@ finally:
 ## Best Practices
 
 1. **Always use --writable explicitly** - Never set write mode as default
-2. **Use transactions for batch operations** - Group related changes
+2. **Use interactive transactions only to queue/review work** - They are not an atomic batch write
 3. **Test on copies first** - Try operations on a copy of your YAML file
 4. **Add WHERE clauses to DELETE** - Avoid accidental full deletes
 5. **Validate after writes** - Query to confirm changes applied correctly

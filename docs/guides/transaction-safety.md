@@ -1,6 +1,7 @@
 # Transaction Safety Guide
 
-YamlQL provides multiple layers of safety to ensure your YAML files remain consistent and recoverable, even when write operations fail.
+YamlQL protects each individual SQL write statement with a file transaction.
+It does not provide a multi-statement SQL transaction.
 
 ## How Transactions Work
 
@@ -12,7 +13,9 @@ YamlQL uses a **three-phase commit** approach for all write operations:
 3. COMMIT: Atomically write changes to disk
 ```
 
-If any step fails, the original file remains unchanged.
+For one SQL write statement, a failure before replacement leaves the source
+unchanged. Tested rejected writer and SQL statements leave the file
+byte-identical.
 
 ## Atomic File Operations
 
@@ -37,9 +40,12 @@ else:
 **What happens internally:**
 1. Backup created: `config.yaml.backup`
 2. Changes written to: `config.yaml.tmp`
-3. Validate YAML syntax
+3. Validate every document in the YAML stream and retain the document count
 4. Atomic rename: `config.yaml.tmp` → `config.yaml`
 5. Cleanup backup on success
+
+For multi-document streams, the writer renders the changed document and keeps
+the source bytes of untouched documents in the tested cases.
 
 ### Transaction Mode (Interactive)
 
@@ -61,20 +67,21 @@ YamlQL [TXN:3]> commit
 Committing 3 operations...
 ✅ Transaction committed (3 operations executed)
 
-# NOW the file is updated atomically
+# Each queued statement now executes as its own file transaction
 ```
 
-**Benefits:**
-- All operations succeed or all fail together
-- File is only touched once
-- Validation happens before any writes
-- Easy to review changes before committing
+`BEGIN` queues SQL text, and `COMMIT` executes the queued statements one at a
+time. `ROLLBACK` discards queued work before commit, but `COMMIT` is not one
+atomic file transaction: if statement $n$ fails, statements $1..n-1$ can
+already be committed.
 
 ## Rollback Mechanisms
 
 ### Automatic Rollback
 
-If any error occurs during a transaction, changes are automatically rolled back:
+If a single statement raises while its file transaction is active, its pending
+write is rolled back. This does not roll back an earlier, separately committed
+`yql.query()` call:
 
 ```python
 from yamlql_library import YamlQL
@@ -82,12 +89,11 @@ from yamlql_library import YamlQL
 yql = YamlQL("config.yaml", mode="rw")
 
 try:
-    # Start multiple operations
+    # This successful statement commits before the next call begins.
     yql.query("INSERT INTO users VALUES ('Alice', 30)")
-    yql.query("INSERT INTO users VALUES ('Bob', 'invalid_age')")  # This will fail
+    yql.query("INSERT INTO users VALUES ('Bob', 'invalid_age')")
 except Exception:
-    # Original file is untouched
-    print("❌ Transaction failed, file unchanged")
+    print("❌ The failing statement was not committed; inspect earlier writes")
 ```
 
 ### Manual Rollback
@@ -154,36 +160,21 @@ users:
 
 ## Format Preservation
 
-YamlQL preserves your YAML file's formatting:
+The writer's fidelity guarantees are limited to the golden-tested cases in the
+[CRUD Operations Guide](crud-operations.md): detected indentation; LF/CRLF,
+BOM, and trailing-newline handling; quote, block-scalar, and flow styles;
+defined comment ownership; anchors, merge keys, tags, and document streams.
+Numeric and boolean literal spelling is not guaranteed after an update.
 
-**Before:**
-```yaml
-# Production Configuration
-services:
-  # Main API server
-  - name: api
-    port: 8080
-    # Enable for debugging
-    debug: false
-```
+## Structural and concurrency limits
 
-**After:** `UPDATE services SET port = 8081 WHERE name = 'api'`
-```yaml
-# Production Configuration
-services:
-  # Main API server
-  - name: api
-    port: 8081  # <-- Only this changed
-    # Enable for debugging
-    debug: false
-```
-
-**Preserved:**
-- ✅ Comments
-- ✅ Indentation
-- ✅ Blank lines
-- ✅ Key order
-- ✅ Multi-line strings
+- A SQL `UPDATE` cannot change a mapping or sequence to a scalar, including
+    `NULL`, or the reverse. It is rejected before commit; only the writer's
+    Python API offers `allow_kind_change=True`.
+- Atomic replacement prevents torn files, not lost updates. YamlQL has no
+    lock, source hash, or other concurrency control.
+- The SQL read model is lossy: it shallow-merges mapping documents and does
+    not expose document boundaries or non-mapping documents.
 
 ## Recovery Strategies
 
@@ -287,7 +278,7 @@ with open("config.yaml", "r+") as f:
 
 ## Best Practices
 
-### 1. Always Use Transactions for Batch Operations
+### 1. Review Interactive Batches Before Commit
 
 ❌ **Bad:**
 ```bash
@@ -305,8 +296,10 @@ YamlQL> INSERT INTO users VALUES ('Alice', 30);
 YamlQL> INSERT INTO users VALUES ('Bob', 25);
 YamlQL> INSERT INTO users VALUES ('Charlie', 35);
 YamlQL> commit
-# File is written once atomically
+# Each queued statement is written through its own file transaction
 ```
+
+This improves reviewability, but does not make the batch atomic.
 
 ### 2. Validate After Write
 
@@ -408,22 +401,20 @@ Pending operations: 3
 
 ## Summary
 
-**YamlQL Transaction Safety Guarantees:**
+**Per-statement safety guarantees:**
 
-✅ Atomic operations - all or nothing  
-✅ Automatic backups before changes  
-✅ Format preservation  
-✅ Type preservation  
-✅ Validation before commit  
-✅ Automatic rollback on errors  
-✅ Opt-in write mode  
-✅ Warning for dangerous operations  
+- Backup before mutation, temporary-file serialization, stream validation, and
+    atomic replacement for one SQL write statement.
+- Rollback of that statement when its write fails before replacement.
+- The documented, golden-tested fidelity behaviors in the CRUD guide; not a
+    general or byte-for-byte formatting guarantee for arbitrary edits.
+- Opt-in write mode and dangerous-operation warnings.
 
 **What You Should Do:**
 
 1. Use version control (Git)
 2. Test on copies first
-3. Use transactions for batch operations
+3. Treat interactive batches as sequential statements, not an atomic transaction
 4. Validate after writes
 5. Keep backups
 

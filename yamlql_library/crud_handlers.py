@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 from .reverse_transformer import ReverseTransformer
 from .transaction import TransactionManager
+from .writer import YamlWriterPolicyError
 
 
 class InsertHandler:
@@ -447,9 +448,20 @@ class InsertHandler:
         with TransactionManager(self.file_path) as txn:
             writer = txn.get_writer()
             writer.load()
+
+            # The read model omits non-mapping documents, so SQL tables can
+            # address only mapping documents in a YAML document stream.
+            document_index = writer.find_document(table_name)
+            if writer.doc_count == 1 and isinstance(writer.data, list):
+                document_index = 0
+            yaml_data = (
+                writer.documents[document_index]
+                if document_index is not None
+                else None
+            )
             
             # Convert each row to YAML paths
-            for row in rows:
+            for row_index, row in enumerate(rows):
                 # Use reverse transformer to get path→value pairs
                 path_value_pairs = self.reverse_transformer.row_to_yaml_path(table_name, row)
                 
@@ -457,16 +469,35 @@ class InsertHandler:
                 # For list-based tables (most common), append to the list
                 # For dict-based tables, merge keys
                 
-                if self._is_list_table(table_name, writer.data):
-                    # Append new item to list
-                    self._append_to_list_table(table_name, path_value_pairs, writer)
-                else:
-                    # Merge into dict structure
-                    self._merge_into_dict_table(table_name, path_value_pairs, writer)
+                try:
+                    if self._is_list_table(
+                        table_name,
+                        yaml_data,
+                        allow_root_list=writer.doc_count == 1,
+                    ):
+                        # Append new item to list
+                        self._append_to_list_table(
+                            table_name,
+                            path_value_pairs,
+                            writer,
+                            document_index,
+                        )
+                    else:
+                        # Merge into dict structure
+                        self._merge_into_dict_table(table_name, path_value_pairs, writer)
+                except YamlWriterPolicyError as error:
+                    raise ValueError(
+                        f"Cannot insert into table '{table_name}', row {row_index}: {error}"
+                    ) from error
         
         return len(rows)
     
-    def _is_list_table(self, table_name: str, yaml_data: Any) -> bool:
+    def _is_list_table(
+        self,
+        table_name: str,
+        yaml_data: Any,
+        allow_root_list: bool = True,
+    ) -> bool:
         """
         Determine if a table represents a YAML list.
         
@@ -481,8 +512,8 @@ class InsertHandler:
         if isinstance(yaml_data, dict) and table_name in yaml_data:
             return isinstance(yaml_data[table_name], list)
         
-        # Check if the entire YAML is a list (root-level list)
-        if isinstance(yaml_data, list):
+        # Root-level lists are meaningful only for single-document files.
+        if allow_root_list and isinstance(yaml_data, list):
             return True
         
         return False
@@ -491,7 +522,8 @@ class InsertHandler:
         self,
         table_name: str,
         path_value_pairs: Dict[str, Any],
-        writer: Any
+        writer: Any,
+        document_index: Optional[int],
     ) -> None:
         """
         Append a new item to a list-based table.
@@ -505,25 +537,26 @@ class InsertHandler:
         item = self.reverse_transformer.build_nested_dict(path_value_pairs)
         
         # Determine the list path
-        if isinstance(writer.data, list):
+        yaml_data = (
+            writer.documents[document_index]
+            if document_index is not None
+            else None
+        )
+        if isinstance(yaml_data, list):
             # Root-level list
             list_path = None
-        elif isinstance(writer.data, dict) and table_name in writer.data:
+        elif isinstance(yaml_data, dict) and table_name in yaml_data:
             # Named list
             list_path = table_name
         else:
             raise ValueError(f"Cannot find list for table '{table_name}'")
         
-        # Append the item
-        if list_path is None:
-            # Append to root list
-            writer.data.append(item)
-        else:
-            # Append to named list
-            current_list = writer.data[list_path]
+        if list_path is not None:
+            current_list = yaml_data[list_path]
             if not isinstance(current_list, list):
                 raise ValueError(f"Expected list at '{list_path}', found {type(current_list).__name__}")
-            current_list.append(item)
+
+        writer.append_item(list_path, item, doc=document_index)
     
     def _merge_into_dict_table(
         self,
@@ -549,6 +582,8 @@ class InsertHandler:
             
             try:
                 writer.insert_value(full_path, value)
+            except YamlWriterPolicyError:
+                raise
             except ValueError:
                 # Key already exists - this is an error for INSERT
                 raise ValueError(f"Key '{full_path}' already exists. Use UPDATE to modify existing data.")
@@ -1069,6 +1104,24 @@ class UpdateHandler:
             # Update each matching row
             for _, row in matching_rows.iterrows():
                 yaml_path = row['_yaml_path']
+                writer_path_prefix = self._strip_root_prefix(yaml_path)
+                if writer_path_prefix:
+                    document_key = writer_path_prefix.split('.', 1)[0]
+                    document_index = writer.find_document(document_key)
+                elif writer.doc_count == 1:
+                    document_index = 0
+                else:
+                    raise ValueError(
+                        "Cannot update a root-level list in a multi-document YAML stream"
+                    )
+
+                if document_index is None:
+                    document_index = writer.find_document(table_name)
+                if document_index is None:
+                    raise ValueError(
+                        f"Cannot find a mapping document for table '{table_name}'"
+                    )
+                yaml_data = writer.documents[document_index]
                 
                 # For each SET clause, update the corresponding YAML path
                 for col_name, new_value in set_clauses.items():
@@ -1090,7 +1143,7 @@ class UpdateHandler:
                     
                     # Convert column name to YAML path using reverse transformer
                     target_path = self._resolve_yaml_path(
-                        table_name, col_name, yaml_path, writer.data
+                        table_name, col_name, yaml_path, yaml_data
                     )
                     
                     # Strip "root." prefix for writer (same as DELETE handler)
@@ -1100,11 +1153,21 @@ class UpdateHandler:
                     new_value = self._convert_numpy_types(new_value)
                     
                     # Update the value in YAML
-                    if writer_path:
-                        writer.set_value(writer_path, new_value)
-                    else:
-                        # Updating root itself (rare case)
-                        writer.data = new_value
+                    try:
+                        if writer_path:
+                            writer.set_value(writer_path, new_value)
+                        else:
+                            # Updating root itself (rare case)
+                            if writer.doc_count != 1:
+                                raise ValueError(
+                                    "Cannot update a root document in a multi-document YAML stream"
+                                )
+                            writer.set_root(new_value)
+                    except YamlWriterPolicyError as error:
+                        raise ValueError(
+                            f"Cannot update table '{table_name}', row '{yaml_path}', "
+                            f"column '{col_name}': {error}"
+                        ) from error
         
         return len(matching_rows)
     
@@ -1568,6 +1631,10 @@ class DeleteHandler:
                         # Special case: deleting root itself (should rarely happen)
                         import sys
                         print(f"Warning: Cannot delete root path '{yaml_path}'", file=sys.stderr)
+                except YamlWriterPolicyError as error:
+                    raise ValueError(
+                        f"Cannot delete from table '{table_name}', row '{yaml_path}': {error}"
+                    ) from error
                 except ValueError as e:
                     # Log warning but continue with other deletions
                     import sys
