@@ -14,7 +14,7 @@ import re
 from typing import Any, List, Optional, Set, Tuple, Union
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap, CommentedSeq, TaggedScalar
-from ruamel.yaml.events import DocumentEndEvent, DocumentStartEvent
+from ruamel.yaml.events import AliasEvent, DocumentEndEvent, DocumentStartEvent
 from ruamel.yaml.scalarstring import (
     DoubleQuotedScalarString,
     FoldedScalarString,
@@ -22,6 +22,7 @@ from ruamel.yaml.scalarstring import (
     PlainScalarString,
     SingleQuotedScalarString,
 )
+from .ruamel_compat import check_ruamel_compatibility
 
 
 class YamlWriterPolicyError(ValueError):
@@ -94,6 +95,8 @@ class YamlWriter:
         Raises:
             FileNotFoundError: If the file does not exist
         """
+        check_ruamel_compatibility()
+
         self.file_path = Path(file_path)
         if not self.file_path.exists():
             raise FileNotFoundError(f"YAML file not found: {self.file_path}")
@@ -105,7 +108,10 @@ class YamlWriter:
         self.yaml.width = 2 ** 31 - 1
         self._apply_format_profile(FormatProfile())
         
-        self.documents: List[Any] = []
+        self._documents: List[Any] = []
+        self._document_count = 0
+        self._tree_is_stale = False
+        self._anchor_event_binding_cache = {}
         self._is_loaded = False
         self._format_profile: Optional[FormatProfile] = None
         self._source_bytes: Optional[bytes] = None
@@ -115,12 +121,23 @@ class YamlWriter:
         self._is_dirty = False
         self._source_matches_data = False
         self._document_spans: List[Tuple[int, int, int, int]] = []
+        self._source_spans_current = False
         self._dirty_documents: Set[int] = set()
 
     @property
     def data(self) -> Any:
         """Return the first document for backwards-compatible callers."""
         return self.documents[0] if self.documents else None
+
+    @property
+    def documents(self) -> List[Any]:
+        """Return the round-trip stream, refreshing it after a source splice."""
+        self._ensure_fresh_tree()
+        return self._documents
+
+    @documents.setter
+    def documents(self, value: List[Any]) -> None:
+        self._documents = value
 
     @data.setter
     def data(self, value: Any) -> None:
@@ -137,7 +154,7 @@ class YamlWriter:
     @property
     def doc_count(self) -> int:
         """Return the number of documents in the loaded YAML stream."""
-        return len(self.documents)
+        return self._document_count
     
     def load(self) -> Any:
         """
@@ -155,18 +172,52 @@ class YamlWriter:
 
         self._format_profile = self._detect_format_profile(source_text, has_bom)
         self._apply_format_profile(self._format_profile)
-        self.documents = list(self.yaml.load_all(source_text))
+        if not any(
+            line.strip() and not line.lstrip().startswith("#")
+            for line in source_text.splitlines()
+        ):
+            self.documents = [] if not source_text else [None]
+        else:
+            self.documents = list(self.yaml.load_all(source_text))
         for document in self.documents:
             self._mark_anchors_for_round_trip(document)
         self._source_bytes = source_bytes
         self._capture_source_structure(source_text)
         self._document_spans = self._document_source_spans(source_text)
+        self._source_spans_current = True
+        self._document_count = len(self._documents)
+        self._tree_is_stale = False
+        self._anchor_event_binding_cache = {}
         self._dirty_documents = set()
         self._is_dirty = False
         self._source_matches_data = True
         
         self._is_loaded = True
         return self.data
+
+    def _ensure_fresh_tree(self) -> None:
+        """Synchronously rebuild derived state after a source-only splice.
+
+        STALE-STATE INVARIANT: a source splice makes ``_source_bytes``
+        authoritative and leaves the parsed tree, locations, source spans,
+        and captured structure stale until a tree-aware operation needs them.
+        """
+        if not self._tree_is_stale:
+            return
+        source_text = self._source_text()
+        if source_text is None:
+            raise ValueError("Cannot refresh writer state without source text")
+        normalized = source_text.replace("\r\n", "\n").replace("\r", "\n")
+        self._documents = list(self.yaml.load_all(normalized))
+        for document in self._documents:
+            self._mark_anchors_for_round_trip(document)
+        if not self._source_spans_current:
+            self._document_spans = self._document_source_spans(source_text)
+            self._source_spans_current = True
+        self._tree_is_stale = False
+        self._capture_source_structure(source_text)
+        self._document_count = len(self._documents)
+        self._anchor_event_binding_cache = {}
     
     def set_value(
         self,
@@ -217,12 +268,18 @@ class YamlWriter:
                 value,
                 path,
                 allow_kind_change,
+                document_index,
             )
-            preserve_metadata = not self._is_alias_target(target, index, current)
+            preserve_metadata = not self._is_alias_target(
+                target, index, current, document_index
+            )
             replacement = self._prepare_replacement(
                 current,
                 value,
                 preserve_metadata=preserve_metadata,
+                preserve_anchor=self._should_preserve_anchor(
+                    current, preserve_metadata, document_index, target, index
+                ),
             )
             self._adjust_sequence_eol_comment_column(target, index, replacement)
             self._replace_anchor_definition(
@@ -231,12 +288,15 @@ class YamlWriter:
                 current,
                 replacement,
                 preserve_metadata,
+                document_index,
             )
         else:
             # Handle dict key
             if final_key not in target:
                 raise KeyError(f"Key '{final_key}' does not exist at path: {path}")
             current = target[final_key]
+            if isinstance(current, dict) and isinstance(value, dict):
+                self._clear_replaced_mapping_child_comments(target, final_key)
             self._assert_kind_change_allowed(
                 target,
                 final_key,
@@ -244,12 +304,18 @@ class YamlWriter:
                 value,
                 path,
                 allow_kind_change,
+                document_index,
             )
-            preserve_metadata = not self._is_alias_target(target, final_key, current)
+            preserve_metadata = not self._is_alias_target(
+                target, final_key, current, document_index
+            )
             replacement = self._prepare_replacement(
                 current,
                 value,
                 preserve_metadata=preserve_metadata,
+                preserve_anchor=self._should_preserve_anchor(
+                    current, preserve_metadata, document_index, target, final_key
+                ),
             )
             self._adjust_mapping_eol_comment_column(target, final_key, replacement)
             self._replace_anchor_definition(
@@ -258,6 +324,7 @@ class YamlWriter:
                 current,
                 replacement,
                 preserve_metadata,
+                document_index,
             )
         self._is_dirty = True
         self._dirty_documents.add(document_index)
@@ -294,7 +361,7 @@ class YamlWriter:
         if current_kind != new_kind:
             if not allow_kind_change:
                 raise self._node_kind_change_error("root", current, value)
-            self._assert_root_kind_change_anchor_safe(current)
+            self._assert_root_kind_change_anchor_safe(current, document_index)
 
         self.documents[document_index] = self._prepare_replacement(current, value)
         self._is_dirty = True
@@ -364,6 +431,55 @@ class YamlWriter:
         self._is_dirty = True
         self._dirty_documents.add(document_index)
 
+    def _delete_stale_appended_item(self, path: str, doc: Optional[int]) -> bool:
+        """Undo a final source append without rebuilding its now-stale tree."""
+        if not self._tree_is_stale or not self._source_matches_data:
+            return False
+        # Appending a final item adds a physical line terminator when the
+        # original source had none. Let the normal refreshed-tree path handle
+        # that shape so it can restore the exact no-final-newline source.
+        if not (self._format_profile or FormatProfile()).trailing_newline_suffix:
+            return False
+        try:
+            parts = self._parse_path(path)
+            if not parts:
+                return False
+            document_index = doc if doc is not None else (0 if len(self._documents) == 1 else None)
+            if document_index is None or document_index < 0 or document_index >= len(self._documents):
+                return False
+            parent = self._navigate_to_parent(parts[:-1], self._documents[document_index])
+            index = self._parse_index(parts[-1])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if not isinstance(parent, CommentedSeq) or index != len(parent):
+            return False
+        source_text = self._source_text()
+        if source_text is None or not self._sequence_source_locations_are_trustworthy(parent, source_text):
+            return False
+        lines = source_text.replace('\r\n', '\n').replace('\r', '\n').splitlines(keepends=True)
+        last_line = parent.lc.item(len(parent) - 1)[0]
+        dash_column = lines[last_line].index('-')
+        start_line = last_line + 1
+        while start_line < len(lines):
+            line = lines[start_line]
+            if not line.strip() or line.lstrip().startswith('#') or len(line) - len(line.lstrip()) <= dash_column:
+                break
+            start_line += 1
+        end_line = start_line + 1
+        while end_line < len(lines):
+            line = lines[end_line]
+            if not line.strip() or line.lstrip().startswith('#') or len(line) - len(line.lstrip()) <= dash_column:
+                break
+            end_line += 1
+        if start_line >= len(lines) or not lines[start_line].lstrip().startswith('-'):
+            return False
+        del lines[start_line:end_line]
+        updated = ''.join(lines)
+        if (self._format_profile or FormatProfile()).line_ending == '\r\n':
+            updated = updated.replace('\n', '\r\n')
+        self._replace_source_text(updated)
+        return True
+
     def append_item(
         self,
         list_path: Optional[str],
@@ -421,6 +537,9 @@ class YamlWriter:
         """
         if not self._is_loaded:
             raise ValueError("Call load() before modifying data")
+
+        if self._delete_stale_appended_item(path, doc):
+            return
         
         parts = self._parse_path(path)
         document_index = self._resolve_document(parts, doc)
@@ -432,7 +551,9 @@ class YamlWriter:
             index = self._parse_index(final_key)
             if index >= len(target):
                 raise KeyError(f"List index {index} out of range at path: {path}")
-            self._assert_deletable_anchor(target, index, target[index], path)
+            self._assert_deletable_anchor(
+                target, index, target[index], path, document_index
+            )
             if self._delete_sequence_item_from_source(target, index):
                 self._dirty_documents.add(document_index)
                 return
@@ -452,7 +573,9 @@ class YamlWriter:
                     f"Cannot delete merged key '{final_key}' at path '{path}'; "
                     "delete the '<<' entry or add an own-key override first"
                 )
-            self._assert_deletable_anchor(target, final_key, target[final_key], path)
+            self._assert_deletable_anchor(
+                target, final_key, target[final_key], path, document_index
+            )
             self._source_matches_data = False
             self._delete_mapping_key(target, final_key)
         else:
@@ -460,11 +583,117 @@ class YamlWriter:
         self._is_dirty = True
         self._dirty_documents.add(document_index)
 
+    def append_items(self, list_path: Optional[str], items: List[Any], doc: Optional[int] = None) -> None:
+        """Append all items as one atomic transformation of the selected list."""
+        if not self._is_loaded:
+            raise ValueError("Call load() before modifying data")
+        if not items:
+            return
+        target, document_index = self.resolve_list_target(list_path, doc)
+        prepared = self._prepare_batch_items(target, items)
+        if self._append_items_to_source(target, prepared):
+            return
+        snapshot = deepcopy(target)
+        try:
+            target.extend(prepared)
+        except Exception:
+            target[:] = snapshot
+            raise
+        self._source_matches_data = False
+        self._is_dirty = True
+        self._dirty_documents.add(document_index)
+
+    def delete_values(self, list_path: Optional[str], indexes: List[int], doc: Optional[int] = None) -> None:
+        """Delete original-list indexes as one atomic transformation."""
+        if not self._is_loaded:
+            raise ValueError("Call load() before modifying data")
+        if not indexes:
+            return
+        target, document_index = self.resolve_list_target(list_path, doc)
+        self._validate_batch_indexes(target, indexes)
+        self._assert_batch_deletable_anchors(target, indexes, list_path, document_index)
+        if self._delete_sequence_items_from_source(target, indexes):
+            return
+        snapshot = deepcopy(target)
+        try:
+            for index in sorted(indexes, reverse=True):
+                self._delete_sequence_item(target, index)
+        except Exception:
+            target[:] = snapshot
+            raise
+        self._source_matches_data = False
+        self._is_dirty = True
+        self._dirty_documents.add(document_index)
+
+    def resolve_list_target(
+        self,
+        list_path: Optional[str],
+        doc: Optional[int] = None,
+    ) -> Tuple[list, int]:
+        """Resolve a list path and its document for a coordinated batch edit.
+
+        This exposes only target validation/address resolution; callers must
+        use :meth:`append_items` or :meth:`delete_values` to mutate the list.
+        """
+        try:
+            if not list_path:
+                document_index = self._resolve_document([], doc)
+                target = self.documents[document_index]
+            else:
+                parts = self._parse_path(list_path)
+                document_index = self._resolve_document(parts, doc)
+                target = self._get_value_from_document(parts, document_index)
+        except ValueError as error:
+            if list_path and str(error).startswith("Expected numeric list index"):
+                raise KeyError(f"Path does not exist: {list_path}") from error
+            raise
+        if not isinstance(target, list):
+            location = "root document" if not list_path else f"path: {list_path}"
+            raise TypeError(f"Cannot append to non-list value at {location}")
+        return target, document_index
+
+    def _prepare_batch_items(self, target: list, items: List[Any]) -> List[Any]:
+        prepared = []
+        prototype = target[-1] if target else None
+        validator = YAML()
+        validator.preserve_quotes = True
+        for item in items:
+            candidate = self._prepare_new_sequence_value(target, item, prototype)
+            try:
+                validator.dump(candidate, StringIO())
+            except Exception as error:
+                raise TypeError("Cannot safely render batch list item") from error
+            prepared.append(candidate)
+            prototype = candidate
+        return prepared
+
+    @staticmethod
+    def _validate_batch_indexes(target: list, indexes: List[int]) -> None:
+        if any(isinstance(index, bool) or not isinstance(index, int) for index in indexes):
+            raise TypeError("Batch list indexes must be integers")
+        if len(set(indexes)) != len(indexes):
+            raise ValueError("Batch list indexes must not contain duplicates")
+        for index in indexes:
+            if index < 0 or index >= len(target):
+                raise IndexError(f"List index {index} out of range")
+
+    def _assert_batch_deletable_anchors(self, target: list, indexes: List[int], list_path: Optional[str], document_index: int) -> None:
+        selected = set(indexes)
+        for index in indexes:
+            anchor_name = getattr(getattr(target[index], "anchor", None), "value", None)
+            if not anchor_name:
+                continue
+            definition, occurrences = self._resolve_anchor_group(anchor_name, document_index, target, index)
+            if definition[0] is target and definition[1] == index and any(parent is not target or key not in selected for parent, key, _ in occurrences):
+                path = "root" if not list_path else list_path
+                raise AnchorInUseError(f"Cannot delete anchored node '{anchor_name}' at path '{path}.{index}': {len(occurrences) - 1} alias occurrence(s) still reference it")
+
     @staticmethod
     def _prepare_replacement(
         current: Any,
         replacement: Any,
         preserve_metadata: bool = True,
+        preserve_anchor: bool = True,
     ) -> Any:
         """Preserve anchors and tags while replacing one direct occurrence.
 
@@ -487,14 +716,37 @@ class YamlWriter:
             replacement = CommentedMap(replacement)
         elif isinstance(current, CommentedSeq) and isinstance(replacement, list):
             replacement = CommentedSeq(replacement)
-        elif anchor_name and not hasattr(replacement, "yaml_set_anchor"):
+        elif anchor_name and preserve_anchor and not hasattr(replacement, "yaml_set_anchor"):
             replacement = YamlWriter._wrap_anchored_scalar(current, replacement)
 
         if tag is not None and hasattr(replacement, "yaml_set_ctag"):
             replacement.yaml_set_ctag(tag)
-        if anchor_name and hasattr(replacement, "yaml_set_anchor"):
+        if anchor_name and preserve_anchor and hasattr(replacement, "yaml_set_anchor"):
             replacement.yaml_set_anchor(anchor_name, always_dump=True)
         return replacement
+
+    def _should_preserve_anchor(
+        self,
+        current: Any,
+        preserve_metadata: bool,
+        document_index: int,
+        parent: Any,
+        key: Any,
+    ) -> bool:
+        """Apply the root-list replacement anchor policy without weakening maps."""
+        anchor_name = getattr(getattr(current, "anchor", None), "value", None)
+        if not preserve_metadata or not anchor_name:
+            return False
+        # Direct writer and mapping replacements retain an unreferenced anchor
+        # for backward-compatible round trips. Qualified root-list scalar SQL
+        # replacement intentionally emits its new literal without that stale
+        # definition, while retaining a custom tag.
+        if not self._is_document_root_sequence(parent):
+            return True
+        _, occurrences = self._resolve_anchor_group(
+            anchor_name, document_index, parent, key
+        )
+        return len(occurrences) > 1
 
     @staticmethod
     def _node_kind(value: Any) -> str:
@@ -529,20 +781,21 @@ class YamlWriter:
         replacement: Any,
         path: str,
         allow_kind_change: bool,
+        document_index: int,
     ) -> None:
         """Reject unsafe kind changes before mutating the selected node."""
         if self._node_kind(current) == self._node_kind(replacement):
             return
         if not allow_kind_change:
             raise self._node_kind_change_error(path, current, replacement)
-        self._assert_deletable_anchor(parent, key, current, path)
+        self._assert_deletable_anchor(parent, key, current, path, document_index)
 
-    def _assert_root_kind_change_anchor_safe(self, current: Any) -> None:
+    def _assert_root_kind_change_anchor_safe(self, current: Any, document_index: int) -> None:
         """Reject root replacement when aliases retain its anchor definition."""
         anchor_name = getattr(getattr(current, "anchor", None), "value", None)
         if not anchor_name:
             return
-        alias_count = len(self._anchor_occurrences(anchor_name))
+        alias_count = len(self._anchor_occurrences(anchor_name, document_index))
         if alias_count:
             raise AnchorInUseError(
                 f"Cannot replace anchored root node '{anchor_name}': "
@@ -622,7 +875,11 @@ class YamlWriter:
             return cls._style_new_string(value, prototype, siblings)
         if isinstance(value, dict):
             result = CommentedMap()
-            if isinstance(prototype, CommentedMap) and prototype.fa.flow_style():
+            if (
+                isinstance(prototype, CommentedMap)
+                and prototype.fa.flow_style()
+                and not isinstance(value, CommentedMap)
+            ):
                 result.fa.set_flow_style()
             for child_key, child_value in value.items():
                 child_prototype = prototype.get(child_key) if isinstance(prototype, dict) else None
@@ -670,16 +927,21 @@ class YamlWriter:
             return result
         return value
 
-    def _is_alias_target(self, parent: Any, key: Any, value: Any) -> bool:
+    def _is_alias_target(
+        self,
+        parent: Any,
+        key: Any,
+        value: Any,
+        document_index: int,
+    ) -> bool:
         """Return whether a direct target slot is an alias occurrence."""
         anchor_name = getattr(getattr(value, "anchor", None), "value", None)
         if not anchor_name:
             return False
-        return self._is_alias_occurrence(
-            parent,
-            key,
-            self._anchor_occurrences(anchor_name),
+        definition, _ = self._resolve_anchor_group(
+            anchor_name, document_index, parent, key
         )
+        return parent is not definition[0] or key != definition[1]
 
     def _replace_anchor_definition(
         self,
@@ -688,6 +950,7 @@ class YamlWriter:
         current: Any,
         replacement: Any,
         preserve_metadata: bool,
+        document_index: int,
     ) -> None:
         """Replace an anchor definition and reconnect all of its aliases.
 
@@ -698,7 +961,9 @@ class YamlWriter:
         """
         anchor_name = getattr(getattr(current, "anchor", None), "value", None)
         if preserve_metadata and anchor_name:
-            occurrences = self._anchor_occurrences(anchor_name)
+            _, occurrences = self._resolve_anchor_group(
+                anchor_name, document_index, parent, key
+            )
             if occurrences:
                 for occurrence_parent, occurrence_key, _ in occurrences:
                     occurrence_parent[occurrence_key] = replacement
@@ -748,38 +1013,40 @@ class YamlWriter:
         key: Any,
         value: Any,
         path: str,
+        document_index: int,
     ) -> None:
         """Reject deletion of an anchor definition still used by aliases."""
         anchor_name = getattr(getattr(value, "anchor", None), "value", None)
         if not anchor_name:
             return
-        occurrences = self._node_occurrences(value)
-        if len(occurrences) < 2 or self._is_alias_occurrence(parent, key, occurrences):
+        definition, occurrences = self._resolve_anchor_group(
+            anchor_name, document_index, parent, key
+        )
+        if len(occurrences) < 2 or parent is not definition[0] or key != definition[1]:
             return
         raise AnchorInUseError(
             f"Cannot delete anchored node '{anchor_name}' at path '{path}': "
             f"{len(occurrences) - 1} alias occurrence(s) still reference it"
         )
 
-    def _node_occurrences(self, node: Any) -> List[Tuple[Any, Any, Optional[Tuple[int, int]]]]:
-        """Find direct parent slots that reference ``node``, including aliases."""
-        return self._find_occurrences(lambda child: child is node)
-
     def _anchor_occurrences(
         self,
         anchor_name: str,
+        document_index: int,
     ) -> List[Tuple[Any, Any, Optional[Tuple[int, int]]]]:
-        """Find all direct slots bearing an anchor name in ruamel.yaml 0.19.1."""
+        """Find direct anchor-bearing slots inside one source document."""
         return self._find_occurrences(
             lambda child: getattr(getattr(child, "anchor", None), "value", None)
-            == anchor_name
+            == anchor_name,
+            document_index,
         )
 
     def _find_occurrences(
         self,
         predicate: Any,
+        document_index: int,
     ) -> List[Tuple[Any, Any, Optional[Tuple[int, int]]]]:
-        """Find direct parent slots whose values match ``predicate``."""
+        """Find direct parent slots whose values match ``predicate`` in one document."""
         occurrences = []
 
         def visit(value: Any, ancestors: set) -> None:
@@ -788,7 +1055,7 @@ class YamlWriter:
             next_ancestors = ancestors | {id(value)}
             if isinstance(value, dict):
                 for child_key, child in value.items():
-                    location = value.lc.value(child_key) if hasattr(value, "lc") else None
+                    location = value.lc.key(child_key) if hasattr(value, "lc") else None
                     if predicate(child):
                         occurrences.append((value, child_key, location))
                     visit(child, next_ancestors)
@@ -799,22 +1066,117 @@ class YamlWriter:
                         occurrences.append((value, index, location))
                     visit(child, next_ancestors)
 
-        visit(self.data, set())
+        visit(self.documents[document_index], set())
         return occurrences
 
-    @staticmethod
-    def _is_alias_occurrence(
-        parent: Any,
-        key: Any,
-        occurrences: List[Tuple[Any, Any, Optional[Tuple[int, int]]]],
-    ) -> bool:
-        """Treat every post-definition reference of one anchored object as an alias."""
+    def _anchor_event_bindings(
+        self,
+        anchor_name: str,
+        document_index: int,
+    ) -> Optional[List[bool]]:
+        """Return source-order definition flags for one anchor in one document.
+
+        ``AliasEvent`` is public ruamel parser API. The only parser state this
+        method relies on is the emitted event sequence; node locations come
+        from the round-trip tree's public ``lc`` metadata.
+        """
+        cache_key = (anchor_name, document_index)
+        if cache_key in self._anchor_event_binding_cache:
+            return self._anchor_event_binding_cache[cache_key]
+        source_text = self._source_text()
+        if source_text is None:
+            return None
+        try:
+            events = list(YAML(typ="rt").parse(source_text))
+        except Exception:
+            return None
+        current_document = -1
+        bindings = []
+        for event in events:
+            if isinstance(event, DocumentStartEvent):
+                current_document += 1
+            if current_document != document_index:
+                continue
+            if getattr(event, "anchor", None) != anchor_name:
+                continue
+            bindings.append(not isinstance(event, AliasEvent))
+        self._anchor_event_binding_cache[cache_key] = bindings
+        return bindings
+
+    def _resolve_anchor_group(
+        self,
+        anchor_name: str,
+        document_index: int,
+        target_parent: Any,
+        target_key: Any,
+    ) -> Tuple[
+        Tuple[Any, Any, Optional[Tuple[int, int]]],
+        List[Tuple[Any, Any, Optional[Tuple[int, int]]]],
+    ]:
+        """Resolve the target occurrence to its document-local definition group.
+
+        Reused names are intentionally resolved by source occurrence, not
+        ruamel object identity: each alias belongs to the nearest preceding
+        definition event of the same name in its own document.
+        """
+        occurrences = self._anchor_occurrences(anchor_name, document_index)
+        bindings = self._anchor_event_bindings(anchor_name, document_index)
         ordered = sorted(
-            enumerate(occurrences),
-            key=lambda item: item[1][2] if item[1][2] is not None else (10 ** 9, item[0]),
+            occurrences,
+            key=lambda occurrence: occurrence[2] if occurrence[2] is not None else (10 ** 9, 10 ** 9),
         )
-        defining_parent, defining_key, _ = ordered[0][1]
-        return parent is not defining_parent or key != defining_key
+        target_index = next(
+            (
+                index
+                for index, occurrence in enumerate(ordered)
+                if occurrence[0] is target_parent and occurrence[1] == target_key
+            ),
+            None,
+        )
+        definition_count = (
+            sum(1 for is_definition in bindings if is_definition)
+            if bindings is not None
+            else 0
+        )
+        # A prior alias-to-literal edit removes that alias from the live
+        # round-trip tree while it remains in the immutable source event list.
+        # One definition has only one possible group, so the remaining live
+        # occurrence is still unambiguous. Reused names are rejected below
+        # rather than guessing which source occurrence disappeared.
+        if (
+            bindings is not None
+            and len(bindings) != len(ordered)
+            and definition_count == 1
+            and target_index is not None
+            and all(occurrence[2] is not None for occurrence in ordered)
+        ):
+            return ordered[0], ordered
+        if (
+            bindings is None
+            or target_index is None
+            or len(bindings) != len(ordered)
+            or any(occurrence[2] is None for occurrence in ordered)
+        ):
+            raise YamlWriterPolicyError(
+                f"Cannot resolve anchor '{anchor_name}' identity in document {document_index}"
+            )
+
+        definition_indexes = [
+            index for index, is_definition in enumerate(bindings) if is_definition
+        ]
+        definition_index = max(
+            (index for index in definition_indexes if index <= target_index),
+            default=None,
+        )
+        if definition_index is None:
+            raise YamlWriterPolicyError(
+                f"Cannot resolve anchor '{anchor_name}' identity in document {document_index}"
+            )
+        next_definition = next(
+            (index for index in definition_indexes if index > definition_index),
+            len(ordered),
+        )
+        return ordered[definition_index], ordered[definition_index:next_definition]
 
     @staticmethod
     def _mark_anchors_for_round_trip(value: Any, visited: Optional[set] = None) -> None:
@@ -883,23 +1245,103 @@ class YamlWriter:
             break
         return start
 
-    def _replace_source_text(self, source_text: str) -> None:
-        """Reparse a source-range edit so subsequent mutations see current lines."""
+    def _replace_source_text(
+        self,
+        source_text: str,
+        document_spans: Optional[List[Tuple[int, int, int, int]]] = None,
+    ) -> None:
+        """Install a source splice and defer rebuilding its derived state."""
         profile = self._format_profile or FormatProfile()
         encoded = source_text.encode('utf-8')
         self._source_bytes = (b'\xef\xbb\xbf' if profile.has_bom else b'') + encoded
+        if document_spans is not None:
+            self._document_spans = document_spans
+        self._source_spans_current = document_spans is not None
 
-        # Parse LF-normalized text. Keeping CRLF in ruamel comment tokens makes
-        # it emit duplicate blank lines when the output EOL is applied later.
-        normalized = source_text.replace('\r\n', '\n').replace('\r', '\n')
-        self.documents = list(self.yaml.load_all(normalized))
-        for document in self.documents:
-            self._mark_anchors_for_round_trip(document)
-        self._capture_source_structure(source_text)
-        self._document_spans = self._document_source_spans(source_text)
         self._dirty_documents = set()
         self._is_dirty = True
         self._source_matches_data = True
+        self._tree_is_stale = True
+        self._anchor_event_binding_cache = {}
+
+    def _append_items_to_source(self, sequence: list, values: List[Any]) -> bool:
+        """Splice a complete block-list append exactly once."""
+        if not isinstance(sequence, CommentedSeq) or not sequence:
+            return False
+        source_text = self._source_text()
+        if not self._source_matches_data or source_text is None or sequence.fa.flow_style() or not self._sequence_source_locations_are_trustworthy(sequence, source_text):
+            return False
+        lines = source_text.replace('\r\n', '\n').replace('\r', '\n').splitlines(keepends=True)
+        last_line = sequence.lc.item(len(sequence) - 1)[0]
+        dash_column = lines[last_line].index('-')
+        end_line = last_line + 1
+        while end_line < len(lines):
+            line = lines[end_line]
+            if not line.strip() or line.lstrip().startswith('#') or len(line) - len(line.lstrip()) <= dash_column:
+                break
+            end_line += 1
+        insertion = []
+        for value in values:
+            fragment = StringIO()
+            renderer = YAML()
+            renderer.preserve_quotes = True
+            renderer.default_flow_style = False
+            renderer.width = self.yaml.width
+            renderer.indent(mapping=2, sequence=2, offset=0)
+            renderer.dump(CommentedSeq([value]), fragment)
+            insertion.extend(' ' * dash_column + (line.lstrip() if line_index == 0 else line) + '\n' for line_index, line in enumerate(fragment.getvalue().replace('\r\n', '\n').splitlines()))
+        if end_line and not lines[end_line - 1].endswith('\n'):
+            lines[end_line - 1] += '\n'
+        lines[end_line:end_line] = insertion
+        updated = ''.join(lines)
+        if (self._format_profile or FormatProfile()).line_ending == '\r\n':
+            updated = updated.replace('\n', '\r\n')
+        # G3 source-splice fallback: one parser-backed validation per batch.
+        # It occurs before replacing the authoritative source, so a parser
+        # failure leaves bytes, tree, dirty flags, and spans unchanged.
+        document_spans = self._document_source_spans(updated)
+        if not document_spans:
+            raise ValueError("Cannot safely validate batch source splice")
+        self._replace_source_text(updated, document_spans)
+        return True
+
+    def _delete_sequence_items_from_source(self, sequence: list, indexes: List[int]) -> bool:
+        """Delete several original block-list items by one source splice."""
+        if not isinstance(sequence, CommentedSeq) or len(sequence) <= len(indexes):
+            return False
+        source_text = self._source_text()
+        if not self._source_matches_data or source_text is None or sequence.fa.flow_style() or not self._sequence_source_locations_are_trustworthy(sequence, source_text):
+            return False
+        lines = source_text.replace('\r\n', '\n').replace('\r', '\n').splitlines(keepends=True)
+        ranges = []
+        for index in sorted(indexes, reverse=True):
+            item_line = sequence.lc.item(index)[0]
+            dash_column = len(lines[item_line]) - len(lines[item_line].lstrip())
+            if index + 1 < len(sequence):
+                end_line = self._owned_item_start(lines, sequence.lc.item(index + 1)[0])
+            else:
+                end_line = item_line + 1
+                while end_line < len(lines):
+                    line = lines[end_line]
+                    if not line.strip() or line.lstrip().startswith('#') or len(line) - len(line.lstrip()) <= dash_column:
+                        break
+                    end_line += 1
+            start_line = item_line
+            if not (index == 0 and self._is_document_root_sequence(sequence)):
+                start_line = self._owned_item_start(lines, item_line)
+            ranges.append((start_line, end_line))
+        if any(ranges[index][0] < ranges[index + 1][1] for index in range(len(ranges) - 1)):
+            return False
+        for start, end in ranges:
+            del lines[start:end]
+        updated = ''.join(lines)
+        if (self._format_profile or FormatProfile()).line_ending == '\r\n':
+            updated = updated.replace('\n', '\r\n')
+        document_spans = self._document_source_spans(updated)
+        if not document_spans:
+            raise ValueError("Cannot safely validate batch source splice")
+        self._replace_source_text(updated, document_spans)
+        return True
 
     def _delete_sequence_item_from_source(self, sequence: list, index: int) -> bool:
         """Delete a block-list item by its original source-line range.
@@ -910,6 +1352,11 @@ class YamlWriter:
         the established ruamel-token fallback below.
         """
         if not isinstance(sequence, CommentedSeq) or len(sequence) == 1:
+            return False
+        if not (self._format_profile or FormatProfile()).trailing_newline_suffix:
+            # A prior append necessarily introduced a terminator. The direct
+            # source range deletion cannot distinguish that synthetic suffix
+            # from an original one, while the render fallback can restore it.
             return False
         source_text = self._source_text()
         if (
@@ -943,7 +1390,9 @@ class YamlWriter:
                     break
                 end_line += 1
 
-        start_line = self._owned_item_start(lines, item_line)
+        start_line = item_line
+        if not (index == 0 and self._is_document_root_sequence(sequence)):
+            start_line = self._owned_item_start(lines, item_line)
         del lines[start_line:end_line]
         updated = ''.join(lines)
         profile = self._format_profile or FormatProfile()
@@ -951,6 +1400,10 @@ class YamlWriter:
             updated = updated.replace('\n', '\r\n')
         self._replace_source_text(updated)
         return True
+
+    def _is_document_root_sequence(self, sequence: Any) -> bool:
+        """Return whether a sequence owns a document's leading comments."""
+        return any(sequence is document for document in self.documents)
 
     def _append_sequence_item_to_source(self, sequence: list, value: Any) -> bool:
         """Append a block-list item directly before its post-list section.
@@ -1331,6 +1784,8 @@ class YamlWriter:
                 output = StringIO()
                 explicit_start = self.yaml.explicit_start
                 self._apply_format_profile(profile)
+                if isinstance(self.documents[index], list):
+                    self.yaml.indent(mapping=profile.mapping_indent, sequence=2, offset=0)
                 self.yaml.explicit_start = False
                 self.yaml.dump(self.documents[index], output)
                 self.yaml.explicit_start = explicit_start
@@ -1415,11 +1870,39 @@ class YamlWriter:
         if location is None:
             return
         anchor_name = getattr(getattr(replacement, "anchor", None), "value", None)
-        if not anchor_name:
+        tag = getattr(replacement, "tag", None)
+        if anchor_name:
+            if isinstance(replacement, dict):
+                token.column = location[1] + len(anchor_name) + 2
+                return
+            token.column = location[1] + len(anchor_name) + 2 + len(str(replacement)) + 2
             return
-        token.column = (
-            location[1] + len(anchor_name) + 2 + len(str(replacement)) + 2
-        )
+        if tag is not None:
+            token.column = location[1] + len(str(tag)) + 1
+
+    @staticmethod
+    def _clear_replaced_mapping_child_comments(mapping: dict, key: Any) -> None:
+        """Discard comments owned by children when replacing an entire mapping."""
+        if not isinstance(mapping, CommentedMap):
+            return
+        parts = mapping.ca.items.get(key)
+        token = parts[3] if parts and len(parts) > 3 else None
+        if isinstance(token, list):
+            token = token[0] if token else None
+        key_location = mapping.lc.key(key)
+        if (
+            token is not None
+            and key_location is not None
+            and token.start_mark.line == key_location[0]
+        ):
+            parts[2] = token
+            parts[3] = None
+        elif (
+            token is not None
+            and key_location is not None
+            and token.start_mark.line != key_location[0]
+        ):
+            parts[3] = None
 
     def _capture_source_structure(self, source_text: str) -> None:
         """Keep minimal source metadata needed when ruamel must re-emit a mapping."""

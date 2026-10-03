@@ -6,7 +6,7 @@ This is the inverse operation of DataTransformer - it reconstructs nested
 dictionaries and lists from flat DataFrame rows.
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 
@@ -20,7 +20,7 @@ class ReverseTransformer:
     - Rebuilds nested dictionaries and lists from flat structures
     """
     
-    def __init__(self, column_name_map: dict, original_data: dict = None):
+    def __init__(self, column_name_map: dict, original_data: dict = None, mapping_column_paths: Optional[Dict[str, Dict[str, Tuple[str, ...]]]] = None):
         """
         Initialize the reverse transformer.
         
@@ -31,6 +31,7 @@ class ReverseTransformer:
         """
         self.column_name_map = column_name_map
         self.original_data = original_data or {}
+        self.mapping_column_paths = mapping_column_paths or {}
     
     def row_to_yaml_path(self, table_name: str, row: dict) -> dict:
         """
@@ -57,6 +58,8 @@ class ReverseTransformer:
         # Get the base path from _yaml_path column (if present)
         base_path = row.get('_yaml_path', 'root')
         
+        mapping_paths = self.mapping_column_paths.get(table_name, {})
+
         # Get column mapping for this table
         table_map = self.column_name_map.get(table_name, {})
         
@@ -69,6 +72,10 @@ class ReverseTransformer:
             # NOTE: We DO NOT skip null values - they should be written as YAML null
             # to preserve schema and allow SELECT to return null columns
             
+            if col_name in mapping_paths:
+                path_value_pairs['.'.join(mapping_paths[col_name])] = value
+                continue
+
             # Look up original column name from the mapping
             # The mapping tells us the exact original key before sanitization
             if col_name in table_map:

@@ -1,19 +1,147 @@
 import pandas as pd
 import copy
-from typing import Any, Dict, List, Tuple
+import base64
+import datetime
+import json
+import math
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+
+
+class DocumentTableInfo(NamedTuple):
+    """Typed ownership metadata for a document-qualified relation."""
+
+    document_index: int
+    kind: str
+    yaml_key_path_in_document: str
 
 class DataTransformer:
     """Transforms nested dictionary data into relational tables."""
 
-    def __init__(self, data: Dict[str, Any], max_depth: int = 5, strategy: str = "depth"):
+    def __init__(
+        self,
+        data: Dict[str, Any],
+        max_depth: int = 5,
+        strategy: str = "depth",
+        expose_mapping_columns: bool = False,
+        stream: Optional[List[Tuple[int, str, Any]]] = None,
+    ):
         """Initializes the DataTransformer with the data to be transformed."""
         self.data = data
         self.max_depth = max_depth
         self.strategy = strategy
+        self.expose_mapping_columns = expose_mapping_columns
+        self.stream = stream
         self.min_dict_size_for_table = 2
         # Bidirectional column name mapping: {table_name: {sanitized_col: original_col, ...}}
         self.column_name_map = {}
         self.column_name_reverse_map = {}  # {table_name: {original_col: sanitized_col, ...}}
+        self.mapping_column_paths = {}
+        self.mapping_column_warnings = []
+        self.table_doc_map: Dict[str, DocumentTableInfo] = {}
+        self.warnings: List[str] = []
+
+    def _canonical_json_value(self, value: Any) -> Any:
+        """Convert a YAML value to a safe, deterministic JSON-native value."""
+        if value is None or isinstance(value, (str, bool, int)):
+            return value
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValueError("non-finite float")
+            return value
+        if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+            return value.isoformat()
+        if isinstance(value, bytes):
+            return base64.b64encode(value).decode("ascii")
+        if isinstance(value, set):
+            converted = [self._canonical_json_value(item) for item in value]
+            return sorted(converted, key=lambda item: json.dumps(item, sort_keys=True, ensure_ascii=False))
+        if isinstance(value, list):
+            return [self._canonical_json_value(item) for item in value]
+        if isinstance(value, dict):
+            if not all(isinstance(key, str) for key in value):
+                raise ValueError("non-string mapping key")
+            return {key: self._canonical_json_value(item) for key, item in value.items()}
+        raise ValueError("unsupported YAML value")
+
+    def _mapping_paths(self, record: Dict[str, Any]) -> List[Tuple[Tuple[str, ...], Dict[str, Any]]]:
+        """Return mapping-valued paths in traversal order, excluding row metadata."""
+        found = []
+
+        def visit(value: Any, path: Tuple[str, ...]) -> None:
+            if not isinstance(value, dict):
+                return
+            if path:
+                found.append((path, value))
+            for key, child in value.items():
+                if key != "_yaml_path":
+                    visit(child, path + (str(key),))
+
+        visit(record, ())
+        return found
+
+    def _append_mapping_columns(
+        self, table_name: str, dataframe: pd.DataFrame, records: List[Dict[str, Any]]
+    ) -> pd.DataFrame:
+        """Append direct canonical-JSON views for mapping fields after legacy columns."""
+        candidates = {}
+        for record in records:
+            for path, value in self._mapping_paths(record):
+                column = self._sanitize_column_name("_".join(path))
+                if column in candidates:
+                    if candidates[column][0] != path:
+                        warning = (
+                            f"{table_name}.{column} has ambiguous mapping paths "
+                            f"{'.'.join(candidates[column][0])} and {'.'.join(path)}"
+                        )
+                        if warning not in self.mapping_column_warnings:
+                            self.mapping_column_warnings.append(warning)
+                    continue
+                candidates[column] = (path, value)
+
+        table_paths = self.mapping_column_paths.setdefault(table_name, {})
+        for column, (path, _) in candidates.items():
+            has_legacy_scalar = False
+            for record in records:
+                current = record
+                for key in path:
+                    if not isinstance(current, dict) or key not in current:
+                        current = None
+                        break
+                    current = current[key]
+                if current is not None and not isinstance(current, dict):
+                    has_legacy_scalar = True
+                    break
+            # json_normalize creates an all-null parent column for mappings;
+            # it is not a legacy scalar/flattened column and must not shadow
+            # the additive direct mapping view.
+            if column in dataframe.columns and not has_legacy_scalar:
+                dataframe = dataframe.drop(columns=[column])
+            # Existing flattened or scalar columns retain ownership of their name.
+            if column in dataframe.columns:
+                continue
+            table_paths[column] = path
+            values = []
+            for row_index, record in enumerate(records):
+                current = record
+                exists = True
+                for key in path:
+                    if not isinstance(current, dict) or key not in current:
+                        exists = False
+                        break
+                    current = current[key]
+                if not exists or current is None or not isinstance(current, dict):
+                    values.append(None)
+                    continue
+                try:
+                    canonical = self._canonical_json_value(current)
+                    values.append(json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+                except (TypeError, ValueError):
+                    self.mapping_column_warnings.append(
+                        f"{table_name}.{column} row {row_index} cannot be represented as canonical JSON"
+                    )
+                    values.append(float("nan"))
+            dataframe[column] = pd.Series(values, dtype=object)
+        return dataframe
 
     def _sanitize_column_name(self, original_name: str) -> str:
         """Sanitizes a column name by replacing special characters with underscores."""
@@ -179,6 +307,8 @@ class DataTransformer:
         parent_df = pd.json_normalize(records_without_nested_lists, sep='_')
         original_columns = list(parent_df.columns)
         parent_df.columns = self._sanitize_and_track_columns(table_name, original_columns)
+        if self.expose_mapping_columns:
+            parent_df = self._append_mapping_columns(table_name, parent_df, records_without_nested_lists)
         
         all_tables = []
         if not parent_df.empty:
@@ -247,10 +377,117 @@ class DataTransformer:
 
     def transform(self) -> List[Tuple[str, pd.DataFrame]]:
         """Transforms the YAML data into a list of relational tables."""
+        self.mapping_column_paths = {}
+        self.mapping_column_warnings = []
+        self.table_doc_map = {}
+        self.warnings = []
         if self.strategy == "adaptive":
-            return self._transform_adaptive()
+            tables = self._transform_adaptive()
+        elif self.strategy == "depth":
+            tables = self._transform_depth()
         else:
-            return self._transform_depth()
+            raise ValueError("strategy must be 'depth' or 'adaptive'")
+
+        if self.stream is not None and len(self.stream) > 1:
+            self._append_document_tables(tables)
+        return tables
+
+    def _append_document_tables(self, tables: List[Tuple[str, pd.DataFrame]]) -> None:
+        """Add document-qualified projections without altering legacy tables."""
+        existing_names = {name for name, _ in tables}
+        document_rows = []
+
+        for document_index, kind, document in self.stream or []:
+            row_tables = []
+            if kind in ("mapping", "list"):
+                document_tables, document_transformer = self._transform_document(document)
+                for local_name, dataframe in document_tables:
+                    qualified_name, key_path = self._qualified_table_name(
+                        document_index, kind, local_name
+                    )
+                    if qualified_name in existing_names:
+                        self.warnings.append(
+                            f"Skipped derived table {qualified_name} because user table "
+                            f"{qualified_name} already exists"
+                        )
+                        continue
+                    existing_names.add(qualified_name)
+                    tables.append((qualified_name, dataframe))
+                    row_tables.append(qualified_name)
+                    self.table_doc_map[qualified_name] = DocumentTableInfo(
+                        document_index, self._document_table_kind(kind, local_name), key_path
+                    )
+                    self._copy_table_metadata(
+                        document_transformer, local_name, qualified_name
+                    )
+            else:
+                # Scalar and null documents intentionally have no SQL
+                # relation. Retain typed ownership metadata so a request for
+                # their public document name fails as a write-policy error,
+                # rather than as a misleading missing-table error.
+                self.table_doc_map[f"doc{document_index}"] = DocumentTableInfo(
+                    document_index, kind, "<root>"
+                )
+
+            document_rows.append(
+                {
+                    "doc_index": document_index,
+                    "kind": kind,
+                    "keys": json.dumps(
+                        [str(key) for key in document] if kind == "mapping" else [],
+                        separators=(",", ":"),
+                    ),
+                    "row_tables": json.dumps(row_tables, separators=(",", ":")),
+                }
+            )
+
+        metadata_name = "_yamlql_documents"
+        if metadata_name in existing_names:
+            self.warnings.append(
+                f"Skipped metadata table {metadata_name} because user table "
+                f"{metadata_name} already exists"
+            )
+            return
+        tables.append((metadata_name, pd.DataFrame(document_rows)))
+
+    def _transform_document(
+        self, document: Any
+    ) -> Tuple[List[Tuple[str, pd.DataFrame]], "DataTransformer"]:
+        """Project one stream document using the established transformer behavior."""
+        transformer = DataTransformer(
+            document,
+            max_depth=self.max_depth,
+            strategy=self.strategy,
+            expose_mapping_columns=self.expose_mapping_columns,
+        )
+        return transformer.transform(), transformer
+
+    def _qualified_table_name(
+        self, document_index: int, kind: str, local_name: str
+    ) -> Tuple[str, str]:
+        """Convert a local document table name to its public qualified name."""
+        prefix = f"doc{document_index}"
+        if kind == "list":
+            suffix = "" if local_name == "root" else local_name.removeprefix("root")
+            return f"{prefix}{suffix}", "<root>" if not suffix else suffix.lstrip("_")
+        return f"{prefix}_{local_name}", local_name
+
+    def _document_table_kind(self, document_kind: str, local_name: str) -> str:
+        """Classify a qualified relation for downstream write routing."""
+        if document_kind == "list" and local_name == "root":
+            return "root-list"
+        return "mapping-collection" if "_" not in local_name else "nested-child"
+
+    def _copy_table_metadata(
+        self, source: "DataTransformer", source_name: str, target_name: str
+    ) -> None:
+        """Retain reversible column metadata under the qualified table name."""
+        if source_name in source.column_name_map:
+            self.column_name_map[target_name] = source.column_name_map[source_name]
+            self.column_name_reverse_map[target_name] = source.column_name_reverse_map[source_name]
+        if source_name in source.mapping_column_paths:
+            self.mapping_column_paths[target_name] = source.mapping_column_paths[source_name]
+        self.mapping_column_warnings.extend(source.mapping_column_warnings)
 
     def _transform_depth(self) -> List[Tuple[str, pd.DataFrame]]:
         """Transforms the data using the depth-based strategy."""
@@ -260,6 +497,11 @@ class DataTransformer:
         # Handle root-level list first
         if isinstance(data_copy, list):
             self._process_node(data_copy, 'root', all_tables, depth=0, current_path="root")
+            return all_tables
+
+        # Scalar and null roots have no legacy relational projection. Stream
+        # metadata records their existence for qualified write policy checks.
+        if not isinstance(data_copy, dict):
             return all_tables
 
         # Add at the top of transform() to handle root scalars
@@ -288,7 +530,7 @@ class DataTransformer:
             # If so, treat it as a single record for a table
             has_only_scalars = all(not isinstance(v, (dict, list)) for v in source_data.values())
             
-            if has_only_scalars:
+            if has_only_scalars and source_data:
                 # This is a single record - create a table with one row
                 all_tables.extend(self._normalize_records('data', [source_data], base_path, is_actual_list=False))
             else:
@@ -303,6 +545,11 @@ class DataTransformer:
     def _transform_adaptive(self) -> List[Tuple[str, pd.DataFrame]]:
         """Transforms the data using the adaptive strategy."""
         all_tables = []
+        if isinstance(self.data, list):
+            self._process_list_adaptive(self.data, "root", all_tables, "root")
+            return all_tables
+        if not isinstance(self.data, dict):
+            return all_tables
         root_scalar_data = {}
         top_level_objects = {}
 
@@ -367,4 +614,6 @@ class DataTransformer:
             original_columns = list(df.columns)
             df.columns = self._sanitize_and_track_columns(table_name, original_columns)
             df['_yaml_path'] = [f"{current_path}.{i}" for i in range(len(df))]
+            if self.expose_mapping_columns:
+                df = self._append_mapping_columns(table_name, df, list_value)
             tables_list.append((table_name, df)) 

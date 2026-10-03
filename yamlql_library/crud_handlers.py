@@ -12,17 +12,148 @@ The CRUD handlers bridge the gap between SQL write operations and YAML persisten
 5. Update in-memory database to maintain consistency
 """
 
-from typing import Dict, Any, List, Optional, TYPE_CHECKING
+import json
+from pathlib import Path
+from typing import Dict, Any, List, Optional, TYPE_CHECKING, Tuple
 import pandas as pd
 import sqlglot
 from sqlglot.expressions import Insert, Update, Delete, Tuple as SqlTuple, Values
+from ruamel.yaml.comments import CommentedMap
 
 if TYPE_CHECKING:
     from .database import Database
 
 from .reverse_transformer import ReverseTransformer
 from .transaction import TransactionManager
-from .writer import YamlWriterPolicyError
+from .writer import YamlWriter, YamlWriterPolicyError
+from .loader import YamlLoader
+
+
+def _document_kind(value: Any) -> str:
+    """Return the writer-compatible root kind for one YAML document."""
+    if isinstance(value, dict):
+        return "mapping"
+    if isinstance(value, list):
+        return "list"
+    if value is None:
+        return "null"
+    return "scalar"
+
+
+def _find_document_list_path(document: Any, table_path: str) -> Optional[str]:
+    """Resolve a qualified collection's typed transformer path in its document."""
+    expected = table_path.replace("_", "")
+    candidates: List[Tuple[str, ...]] = []
+
+    def visit(value: Any, path: Tuple[str, ...]) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                child_path = path + (str(key),)
+                if isinstance(child, list):
+                    candidates.append(child_path)
+                visit(child, child_path)
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                visit(child, path + (str(index),))
+
+    visit(document, ())
+    matches = [
+        path
+        for path in candidates
+        if "".join(part for part in path if not part.isdigit()).replace("_", "") == expected
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            "Cannot resolve qualified collection path "
+            f"'{table_path}' in its owning document"
+        )
+    return ".".join(matches[0])
+
+
+def _mapping_column_paths_for_table(original_data: Any, table_name: str, mapping_paths: Dict[str, tuple]) -> Dict[str, Optional[Tuple[str, ...]]]:
+    """Build explicit target paths for projected columns, marking collisions ambiguous."""
+    paths: Dict[str, Optional[Tuple[str, ...]]] = {column: tuple(path) for column, path in mapping_paths.items()}
+    records = original_data.get(table_name, []) if isinstance(original_data, dict) else []
+    if not isinstance(records, list):
+        return paths
+
+    def collect(value: Any, path: Tuple[str, ...]) -> None:
+        column = "_".join(path).replace(" ", "_").replace(".", "_").replace("-", "_")
+        existing = paths.get(column)
+        if column not in paths:
+            paths[column] = path
+        elif existing != path:
+            paths[column] = None
+        if isinstance(value, dict):
+            for key, child in value.items():
+                collect(child, path + (str(key),))
+
+    for record in records:
+        if isinstance(record, dict):
+            for key, value in record.items():
+                collect(value, (str(key),))
+    return paths
+
+
+def _assert_non_overlapping_column_paths(columns: List[str], column_paths: Dict[str, Optional[Tuple[str, ...]]]) -> None:
+    """Reject ambiguous or parent/descendant YAML writes before a transaction."""
+    for index, left in enumerate(columns):
+        left_path = column_paths.get(left)
+        for right in columns[index + 1:]:
+            right_path = column_paths.get(right)
+            if left_path is None or right_path is None:
+                raise ValueError(f"{left}, {right} conflict: YAML target path is ambiguous")
+            shared = min(len(left_path), len(right_path))
+            if left_path[:shared] == right_path[:shared]:
+                conflicting_columns = [left, right]
+                for candidate in columns[index + 2:]:
+                    candidate_path = column_paths.get(candidate)
+                    if candidate_path is None or candidate_path[:min(len(left_path), len(candidate_path))] == left_path[:min(len(left_path), len(candidate_path))]:
+                        conflicting_columns.append(candidate)
+                raise ValueError(
+                    f"{', '.join(conflicting_columns)} conflict: YAML target paths overlap"
+                )
+
+
+def _parse_mapping_json(value: Any) -> Any:
+    """Decode JSON text; wrong JSON kinds reach the writer kind guard unchanged."""
+    if not isinstance(value, str):
+        return value
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return value
+    if isinstance(parsed, dict):
+        replacement = CommentedMap(parsed)
+        replacement.fa.set_block_style()
+        return replacement
+    return parsed
+
+
+def _assert_mapping_replacement_safe(writer: YamlWriter, current: Any, column: str, document_index: int) -> None:
+    """Reject map replacement when it would erase merges or live anchors."""
+    if getattr(current, "merge", None):
+        raise ValueError(f"column '{column}' mapping replacement contains a merge key")
+    descendants = set()
+    anchored_descendants = set()
+
+    def visit(value: Any, is_descendant: bool = True) -> None:
+        descendants.add(id(value))
+        if is_descendant and getattr(getattr(value, "anchor", None), "value", None):
+            anchored_descendants.add(id(value))
+        if isinstance(value, dict):
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(current, is_descendant=False)
+    for parent, _, _ in writer._find_occurrences(lambda child: id(child) in anchored_descendants, document_index):
+        if id(parent) not in descendants:
+            raise ValueError(
+                f"column '{column}' mapping replacement would discard an aliased descendant anchor"
+            )
 
 
 class InsertHandler:
@@ -49,7 +180,8 @@ class InsertHandler:
         file_path: str,
         column_name_map: Dict[str, Dict[str, str]],
         original_data: dict,
-        db: "Database"
+        db: "Database",
+        mapping_column_paths: Optional[Dict[str, Dict[str, tuple]]] = None,
     ):
         """
         Initialize the INSERT handler.
@@ -63,9 +195,41 @@ class InsertHandler:
         """
         self.file_path = file_path
         self.column_name_map = column_name_map
+        self.mapping_column_paths = mapping_column_paths or {}
         self.original_data = original_data
         self.db = db
-        self.reverse_transformer = ReverseTransformer(column_name_map, original_data)
+        self.table_doc_map: Dict[str, Any] = {}
+        self.reverse_transformer = ReverseTransformer(column_name_map, original_data, self.mapping_column_paths)
+
+    def _qualified_target(self, table_name: str, writer: Optional[YamlWriter] = None) -> Optional[Any]:
+        """Validate and return a document-qualified target from typed metadata only."""
+        if table_name == "_yamlql_documents":
+            raise ValueError("_yamlql_documents metadata table is read-only")
+        target = self.table_doc_map.get(table_name)
+        if target is None:
+            return None
+        if target.kind in ("scalar", "null"):
+            raise ValueError(
+                f"Cannot write {target.kind} document {target.document_index}"
+            )
+        if writer is None:
+            loader_count = len(YamlLoader(Path(self.file_path)).load_stream())
+            writer = YamlWriter(self.file_path)
+            writer.load()
+            if loader_count != writer.doc_count:
+                raise ValueError(
+                    f"loader and writer document count disagree ({loader_count} != {writer.doc_count})"
+                )
+        if target.document_index >= writer.doc_count:
+            raise ValueError(f"qualified document {target.document_index} does not exist")
+        actual_kind = _document_kind(writer.documents[target.document_index])
+        expected_kind = "list" if target.kind == "root-list" else "mapping"
+        if actual_kind != expected_kind:
+            raise ValueError(
+                f"qualified document {target.document_index} kind mismatch: "
+                f"expected {expected_kind}, found {actual_kind}"
+            )
+        return target
     
     def handle(self, parsed_sql: Insert) -> Dict[str, Any]:
         """
@@ -103,8 +267,16 @@ class InsertHandler:
             rows = self._extract_values(parsed_sql, columns)
             
             # Step 2: Validate schema
+            self._qualified_target(table_name)
             self._validate_table_exists(table_name)
             self._validate_columns_exist(table_name, columns)
+            mapping_columns = self.mapping_column_paths.get(table_name, {})
+            if any(column in mapping_columns for column in columns):
+                _assert_non_overlapping_column_paths(
+                    columns,
+                    _mapping_column_paths_for_table(self.original_data, table_name, mapping_columns),
+                )
+            self._prepare_mapping_values(table_name, rows)
             
             # Step 3: Convert to YAML paths and write atomically
             rows_inserted = self._insert_rows(table_name, columns, rows)
@@ -138,6 +310,13 @@ class InsertHandler:
                 'rows_inserted': 0,
                 'message': f"INSERT failed: {str(e)}"
             }
+
+    def _prepare_mapping_values(self, table_name: str, rows: List[Dict[str, Any]]) -> None:
+        """Decode only explicitly supplied mapping columns; omitted values stay omitted."""
+        for row in rows:
+            for column in self.mapping_column_paths.get(table_name, {}):
+                if column in row:
+                    row[column] = _parse_mapping_json(row[column])
     
     def _extract_table_name(self, parsed_sql: Insert) -> str:
         """
@@ -226,6 +405,14 @@ class InsertHandler:
         
         # No explicit columns - infer from table schema
         return self._get_table_columns(table_name)
+
+    def _has_explicit_columns(self, parsed_sql: Insert) -> bool:
+        """Return whether an INSERT statement supplied its own column list."""
+        return bool(
+            parsed_sql.this
+            and hasattr(parsed_sql.this, 'expressions')
+            and parsed_sql.this.expressions
+        )
     
     def _extract_values(self, parsed_sql: Insert, columns: List[str]) -> List[Dict[str, Any]]:
         """
@@ -424,7 +611,10 @@ class InsertHandler:
             # Filter out metadata columns
             columns = [
                 col for col in schema['column_name'].tolist()
-                if not col.startswith('_')
+                if (
+                    not col.startswith('_')
+                    and col not in self.mapping_column_paths.get(table_name, {})
+                )
             ]
             return columns
         except Exception:
@@ -448,10 +638,11 @@ class InsertHandler:
         with TransactionManager(self.file_path) as txn:
             writer = txn.get_writer()
             writer.load()
+            target = self._qualified_target(table_name, writer)
 
             # The read model omits non-mapping documents, so SQL tables can
             # address only mapping documents in a YAML document stream.
-            document_index = writer.find_document(table_name)
+            document_index = target.document_index if target is not None else writer.find_document(table_name)
             if writer.doc_count == 1 and isinstance(writer.data, list):
                 document_index = 0
             yaml_data = (
@@ -460,35 +651,57 @@ class InsertHandler:
                 else None
             )
             
-            # Convert each row to YAML paths
-            for row_index, row in enumerate(rows):
-                # Use reverse transformer to get path→value pairs
-                path_value_pairs = self.reverse_transformer.row_to_yaml_path(table_name, row)
-                
-                # Determine insertion strategy based on YAML structure
-                # For list-based tables (most common), append to the list
-                # For dict-based tables, merge keys
-                
+            path_value_pairs_by_row = [
+                self.reverse_transformer.row_to_yaml_path(table_name, row)
+                for row in rows
+            ]
+            for column, path_parts in self.mapping_column_paths.get(table_name, {}).items():
+                if not any(column in row and isinstance(row[column], dict) for row in rows):
+                    continue
                 try:
-                    if self._is_list_table(
+                    current = writer.get_value(".".join(path_parts), doc=document_index)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                _assert_mapping_replacement_safe(writer, current, column, document_index)
+            if target is not None and target.kind != "root-list":
+                is_list_table = True
+            else:
+                is_list_table = self._is_list_table(
+                table_name,
+                yaml_data,
+                allow_root_list=writer.doc_count == 1 or target is not None,
+                )
+            if is_list_table:
+                # One SQL statement targeting one list in one document maps to
+                # one source splice.  Preparing every item before mutation also
+                # preserves statement-level atomicity if a row is rejected.
+                try:
+                    self._append_rows_to_list_table(
                         table_name,
-                        yaml_data,
-                        allow_root_list=writer.doc_count == 1,
-                    ):
-                        # Append new item to list
-                        self._append_to_list_table(
-                            table_name,
+                        path_value_pairs_by_row,
+                        writer,
+                        document_index,
+                        target.yaml_key_path_in_document if target is not None else None,
+                    )
+                except YamlWriterPolicyError as error:
+                    raise ValueError(
+                        f"Cannot insert into table '{table_name}': {error}"
+                    ) from error
+            else:
+                # Dict-backed tables have distinct key targets and retain the
+                # established per-row insertion semantics.
+                for row_index, path_value_pairs in enumerate(path_value_pairs_by_row):
+                    try:
+                        self._merge_into_dict_table(
+                            target.yaml_key_path_in_document if target is not None else table_name,
                             path_value_pairs,
                             writer,
                             document_index,
                         )
-                    else:
-                        # Merge into dict structure
-                        self._merge_into_dict_table(table_name, path_value_pairs, writer)
-                except YamlWriterPolicyError as error:
-                    raise ValueError(
-                        f"Cannot insert into table '{table_name}', row {row_index}: {error}"
-                    ) from error
+                    except YamlWriterPolicyError as error:
+                        raise ValueError(
+                            f"Cannot insert into table '{table_name}', row {row_index}: {error}"
+                        ) from error
         
         return len(rows)
     
@@ -557,12 +770,43 @@ class InsertHandler:
                 raise ValueError(f"Expected list at '{list_path}', found {type(current_list).__name__}")
 
         writer.append_item(list_path, item, doc=document_index)
+
+    def _append_rows_to_list_table(
+        self,
+        table_name: str,
+        path_value_pairs_by_row: List[Dict[str, Any]],
+        writer: Any,
+        document_index: Optional[int],
+        qualified_path: Optional[str] = None,
+    ) -> None:
+        """Append compatible statement rows with one writer batch call."""
+        yaml_data = (
+            writer.documents[document_index]
+            if document_index is not None
+            else None
+        )
+        if isinstance(yaml_data, list):
+            list_path = None
+        elif isinstance(yaml_data, dict):
+            list_path = _find_document_list_path(yaml_data, qualified_path or table_name)
+        else:
+            raise ValueError(f"Cannot find list for table '{table_name}'")
+
+        if isinstance(yaml_data, list):
+            items = [path_value_pairs["value"] for path_value_pairs in path_value_pairs_by_row]
+        else:
+            items = [
+                self.reverse_transformer.build_nested_dict(path_value_pairs)
+                for path_value_pairs in path_value_pairs_by_row
+            ]
+        writer.append_items(list_path, items, doc=document_index)
     
     def _merge_into_dict_table(
         self,
         table_name: str,
         path_value_pairs: Dict[str, Any],
-        writer: Any
+        writer: Any,
+        document_index: Optional[int] = None,
     ) -> None:
         """
         Merge values into a dict-based table.
@@ -581,7 +825,7 @@ class InsertHandler:
                 full_path = path
             
             try:
-                writer.insert_value(full_path, value)
+                writer.insert_value(full_path, value, doc=document_index)
             except YamlWriterPolicyError:
                 raise
             except ValueError:
@@ -747,7 +991,8 @@ class UpdateHandler:
         file_path: str,
         column_name_map: Dict[str, Dict[str, str]],
         original_data: dict,
-        db: "Database"
+        db: "Database",
+        mapping_column_paths: Optional[Dict[str, Dict[str, tuple]]] = None,
     ):
         """
         Initialize the UPDATE handler.
@@ -761,9 +1006,14 @@ class UpdateHandler:
         """
         self.file_path = file_path
         self.column_name_map = column_name_map
+        self.mapping_column_paths = mapping_column_paths or {}
         self.original_data = original_data
         self.db = db
-        self.reverse_transformer = ReverseTransformer(column_name_map, original_data)
+        self.table_doc_map: Dict[str, Any] = {}
+        self.reverse_transformer = ReverseTransformer(column_name_map, original_data, self.mapping_column_paths)
+
+    def _qualified_target(self, table_name: str, writer: Optional[YamlWriter] = None) -> Optional[Any]:
+        return InsertHandler._qualified_target(self, table_name, writer)
     
     def handle(self, parsed_sql: Update) -> Dict[str, Any]:
         """
@@ -802,8 +1052,16 @@ class UpdateHandler:
             where_clause = self._extract_where_clause(parsed_sql)
             
             # Step 2: Validate schema
+            self._qualified_target(table_name)
             self._validate_table_exists(table_name)
             self._validate_columns_exist(table_name, list(set_clauses.keys()))
+            mapping_columns = self.mapping_column_paths.get(table_name, {})
+            if any(column in mapping_columns for column in set_clauses):
+                _assert_non_overlapping_column_paths(
+                    list(set_clauses.keys()),
+                    _mapping_column_paths_for_table(self.original_data, table_name, mapping_columns),
+                )
+            self._prepare_mapping_values(table_name, set_clauses)
             
             # Step 3: Find matching rows using WHERE clause
             matching_rows = self._find_matching_rows(table_name, where_clause)
@@ -847,6 +1105,12 @@ class UpdateHandler:
                 'rows_updated': 0,
                 'message': f"UPDATE failed: {str(e)}"
             }
+
+    def _prepare_mapping_values(self, table_name: str, set_clauses: Dict[str, Any]) -> None:
+        """Decode object JSON for direct mapping columns before writer updates."""
+        for column in self.mapping_column_paths.get(table_name, {}):
+            if column in set_clauses:
+                set_clauses[column] = _parse_mapping_json(set_clauses[column])
     
     def _extract_table_name(self, parsed_sql: Update) -> str:
         """
@@ -1100,12 +1364,15 @@ class UpdateHandler:
         with TransactionManager(self.file_path) as txn:
             writer = txn.get_writer()
             writer.load()
+            target = self._qualified_target(table_name, writer)
             
             # Update each matching row
             for _, row in matching_rows.iterrows():
                 yaml_path = row['_yaml_path']
                 writer_path_prefix = self._strip_root_prefix(yaml_path)
-                if writer_path_prefix:
+                if target is not None:
+                    document_index = target.document_index
+                elif writer_path_prefix:
                     document_key = writer_path_prefix.split('.', 1)[0]
                     document_index = writer.find_document(document_key)
                 elif writer.doc_count == 1:
@@ -1122,6 +1389,15 @@ class UpdateHandler:
                         f"Cannot find a mapping document for table '{table_name}'"
                     )
                 yaml_data = writer.documents[document_index]
+                for column, path_parts in self.mapping_column_paths.get(table_name, {}).items():
+                    if column in set_clauses and isinstance(set_clauses[column], dict):
+                        target_path = self._resolve_yaml_path(
+                            table_name, column, yaml_path, yaml_data
+                        )
+                        current = writer.get_value(
+                            self._strip_root_prefix(target_path), doc=document_index
+                        )
+                        _assert_mapping_replacement_safe(writer, current, column, document_index)
                 
                 # For each SET clause, update the corresponding YAML path
                 for col_name, new_value in set_clauses.items():
@@ -1142,9 +1418,12 @@ class UpdateHandler:
                             ) from eval_error
                     
                     # Convert column name to YAML path using reverse transformer
-                    target_path = self._resolve_yaml_path(
-                        table_name, col_name, yaml_path, yaml_data
-                    )
+                    if target is not None and target.kind == "root-list" and col_name == "value":
+                        target_path = yaml_path
+                    else:
+                        target_path = self._resolve_yaml_path(
+                            table_name, col_name, yaml_path, yaml_data
+                        )
                     
                     # Strip "root." prefix for writer (same as DELETE handler)
                     writer_path = self._strip_root_prefix(target_path)
@@ -1155,7 +1434,7 @@ class UpdateHandler:
                     # Update the value in YAML
                     try:
                         if writer_path:
-                            writer.set_value(writer_path, new_value)
+                            writer.set_value(writer_path, new_value, doc=document_index)
                         else:
                             # Updating root itself (rare case)
                             if writer.doc_count != 1:
@@ -1200,6 +1479,10 @@ class UpdateHandler:
             table_name="users", column_name="user_name", row_yaml_path="root.1"
             → "root.1.user-name" (if original was hyphenated)
         """
+        mapping_path = self.mapping_column_paths.get(table_name, {}).get(column_name)
+        if mapping_path is not None:
+            return ".".join((row_yaml_path,) + tuple(mapping_path))
+
         # Get column mapping for this table
         table_map = self.column_name_map.get(table_name, {})
         
@@ -1382,7 +1665,8 @@ class DeleteHandler:
         file_path: str,
         column_name_map: Dict[str, Dict[str, str]],
         original_data: dict,
-        db: "Database"
+        db: "Database",
+        mapping_column_paths: Optional[Dict[str, Dict[str, tuple]]] = None,
     ):
         """
         Initialize the DELETE handler.
@@ -1396,9 +1680,14 @@ class DeleteHandler:
         """
         self.file_path = file_path
         self.column_name_map = column_name_map
+        self.mapping_column_paths = mapping_column_paths or {}
         self.original_data = original_data
         self.db = db
+        self.table_doc_map: Dict[str, Any] = {}
         self.reverse_transformer = ReverseTransformer(column_name_map, original_data)
+
+    def _qualified_target(self, table_name: str, writer: Optional[YamlWriter] = None) -> Optional[Any]:
+        return InsertHandler._qualified_target(self, table_name, writer)
     
     def handle(self, parsed_sql: Delete) -> Dict[str, Any]:
         """
@@ -1436,6 +1725,7 @@ class DeleteHandler:
             where_clause = self._extract_where_clause(parsed_sql)
             
             # Step 2: Validate schema
+            self._qualified_target(table_name)
             self._validate_table_exists(table_name)
             
             # Step 3: Find matching rows using WHERE clause
@@ -1612,35 +1902,72 @@ class DeleteHandler:
         with TransactionManager(self.file_path) as txn:
             writer = txn.get_writer()
             writer.load()
+            target = self._qualified_target(table_name, writer)
             
-            # Extract _yaml_path values and sort in reverse order
-            # This ensures we delete from highest index to lowest for lists
             yaml_paths = matching_rows['_yaml_path'].tolist()
-            yaml_paths_sorted = self._sort_paths_for_deletion(yaml_paths)
-            
-            # Delete each YAML node
-            for yaml_path in yaml_paths_sorted:
+            batch_groups, sequential_paths = self._group_list_deletions(writer, yaml_paths, target)
+
+            for (document_index, list_path), indexes in batch_groups.items():
                 try:
-                    # Strip "root." prefix if present - the writer works with paths relative to data root
-                    # _yaml_path format: "root.users.0" or "root.0" or "root"
-                    writer_path = self._strip_root_prefix(yaml_path)
-                    
-                    if writer_path:
-                        writer.delete_value(writer_path)
-                    else:
-                        # Special case: deleting root itself (should rarely happen)
-                        import sys
-                        print(f"Warning: Cannot delete root path '{yaml_path}'", file=sys.stderr)
+                    writer.delete_values(list_path, indexes, doc=document_index)
+                except YamlWriterPolicyError as error:
+                    raise ValueError(
+                        f"Cannot delete from table '{table_name}': {error}"
+                    ) from error
+
+            # Dict-key rows, root paths, ambiguous/mixed targets, and any
+            # other non-list shape keep the established per-row behavior.
+            for yaml_path in self._sort_paths_for_deletion(sequential_paths):
+                writer_path = self._strip_root_prefix(yaml_path)
+                if not writer_path:
+                    raise ValueError(f"Cannot delete root path '{yaml_path}'")
+                try:
+                    writer.delete_value(writer_path, doc=target.document_index if target is not None else None)
                 except YamlWriterPolicyError as error:
                     raise ValueError(
                         f"Cannot delete from table '{table_name}', row '{yaml_path}': {error}"
                     ) from error
-                except ValueError as e:
-                    # Log warning but continue with other deletions
-                    import sys
-                    print(f"Warning: Failed to delete path '{yaml_path}': {e}", file=sys.stderr)
-        
+
         return len(matching_rows)
+
+    def _group_list_deletions(
+        self,
+        writer: Any,
+        yaml_paths: List[str],
+        target: Optional[Any] = None,
+    ) -> tuple:
+        """Group only concrete list-index rows by their document and parent list."""
+        groups: Dict[tuple, List[int]] = {}
+        sequential_paths: List[str] = []
+        for yaml_path in yaml_paths:
+            writer_path = self._strip_root_prefix(yaml_path)
+            parts = writer_path.split('.') if writer_path else []
+            if not parts or not parts[-1].isdigit():
+                sequential_paths.append(yaml_path)
+                continue
+
+            try:
+                if target is not None:
+                    document_index = target.document_index
+                elif parts[0].isdigit():
+                    if writer.doc_count != 1:
+                        raise ValueError("root list in a multi-document stream")
+                    document_index = 0
+                else:
+                    document_index = writer.find_document(parts[0])
+                if document_index is None:
+                    raise ValueError("document not found")
+                list_path = '.'.join(parts[:-1]) or None
+                list_target, resolved_document = writer.resolve_list_target(
+                    list_path,
+                    document_index,
+                )
+                if not isinstance(list_target, list):
+                    raise TypeError("parent is not a list")
+                groups.setdefault((resolved_document, list_path), []).append(int(parts[-1]))
+            except (KeyError, TypeError, ValueError):
+                sequential_paths.append(yaml_path)
+        return groups, sequential_paths
     
     def _strip_root_prefix(self, yaml_path: str) -> str:
         """

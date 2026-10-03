@@ -95,9 +95,14 @@ pip install -r requirements.txt --upgrade
 The CRUD-enabled version adds two new dependencies:
 
 - `sqlglot>=23.0.0` - SQL parsing and classification
-- `ruamel.yaml>=0.18.0` - Format-preserving YAML writes
+- `ruamel.yaml>=0.18.0,<0.20` - Format-preserving YAML writes
 
 These are automatically installed when you upgrade YamlQL via pip.
+
+The writer is certified on ruamel.yaml 0.18.0, 0.18.17, 0.19.0, and 0.19.1.
+At `YamlWriter` construction, a version guard and round-trip capability probe
+run before any write. Install a version in the certified range if the guard
+reports an incompatible runtime.
 
 ## API Changes (Optional)
 

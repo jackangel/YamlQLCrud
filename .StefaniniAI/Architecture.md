@@ -1,6 +1,6 @@
 # System Architecture
 
-*Last Updated: 2026-10-02*
+*Last Updated: 2026-10-03*
 *Confidence Score: 100%*
 
 ---
@@ -16,7 +16,7 @@
   - CLI commands: `yamlql sql` and `yamlql discover`; direct, SQL-file, and interactive execution are supported.
 - **Scope**: `yamlql_library/` is authoritative. `build/` is a stale generated copy and was explicitly excluded.
 
-YamlQL has two related but different pipelines. The read path uses safe semantic loading and creates a lossy relational projection. The write path reloads the source independently with ruamel.yaml round-trip nodes. `_yaml_path` metadata connects projected rows to mutable YAML nodes; it is not a complete concrete-syntax model.
+YamlQL has two related but different pipelines. The read path uses safe semantic loading and creates a relational projection that now retains document ownership for qualified tables, but remains lossy with respect to concrete YAML syntax. The write path reloads the source independently with guarded ruamel.yaml round-trip nodes. `_yaml_path`, reversible column metadata, mapping-column paths, and `table_doc_map` connect projected rows to mutable YAML nodes; none is a complete concrete-syntax model or stable node ID.
 
 ---
 
@@ -25,57 +25,74 @@ YamlQL has two related but different pipelines. The read path uses safe semantic
 ### Components
 
 1. **`YamlQL` facade** — `yamlql_library/__init__.py`
-  - Validates mode; composes loader, transformer, and database; exposes `query()`/`list_tables()`; fully reloads derived state after successful writes.
+  - Validates mode; composes loader, transformer, and database; exposes `query()`/`list_tables()` and a copy-returning `warnings` property.
+  - Loads the semantic document stream once through `YamlLoader.load_stream()`, reconstructs the legacy merged `original_data` view from that stream, and passes the same stream to `DataTransformer` when document collection tables are applicable.
+  - After a successful write, builds a complete replacement projection and database before swapping it in. If reload/registration fails, it closes the old database and leaves a new empty database rather than retaining stale document tables.
 
 2. **`YamlLoader` input adapter** — `yamlql_library/loader.py`
-  - Reads UTF-8 text, normalizes separator lines, quotes selected YAML 1.1 boolean-like keys at column zero, and invokes PyYAML `load_all()` with a dedicated `_ApplicationTagSafeLoader` subclass.
+  - `_load_documents()` is the shared UTF-8 parse path for both public views. It normalizes separator lines, quotes selected YAML 1.1 boolean-like keys at column zero, and invokes PyYAML `load_all()` with a dedicated `_ApplicationTagSafeLoader` subclass.
   - The dedicated loader accepts application-defined scalar, sequence, and mapping tags as their underlying safe values while explicitly rejecting fallback construction for the `tag:yaml.org,2002:` namespace. The global PyYAML `SafeLoader` is not modified.
-  - Multiple mapping documents are shallow-merged; later top-level keys win. Document boundaries and non-mapping documents are still lost from the SQL query model.
+  - `load()` preserves the legacy dictionary contract: multiple mapping documents are shallow-merged and later top-level keys win.
+  - `load_stream()` adds an ordered `(index, kind, data)` view, where kind is `mapping`, `list`, `scalar`, or `null`. A non-empty whitespace/comment-only stream, including tab-only blank lines, is aligned with the writer as one null document; an empty byte stream has no documents.
 
 3. **`DataTransformer` relational projector** — `yamlql_library/transformer.py`
   - Recursively creates pandas DataFrames using depth or adaptive strategy.
   - Flattens mappings, extracts homogeneous nested lists of objects, handles scalar lists, sanitizes names, tracks reverse name maps, and adds `_yaml_path`.
+  - With opt-in `expose_mapping_columns=True`, appends direct mapping-valued columns as canonical JSON text and records each column's original tuple path in `mapping_column_paths`. Canonicalization sorts object keys and sets, compacts separators, preserves Unicode, converts date/time values to ISO-8601 and bytes to base64, and records warnings/nulls for values that cannot be represented safely. Legacy flattened columns retain precedence on name collisions.
+  - For applicable multi-document streams, retains legacy unqualified tables and adds `doc{N}_{table}` mapping-document tables, `doc{N}` root-list tables, qualified nested child tables, and read-only `_yamlql_documents(doc_index, kind, keys, row_tables)` metadata. Scalar/null documents are metadata-only.
+  - `DocumentTableInfo(document_index, kind, yaml_key_path_in_document)` and `table_doc_map` form the typed write-routing contract. Qualified-name collisions are skipped and exposed through transformer/facade warnings; names are never parsed to infer routing.
   - Nested-list extraction is based on the first record and requires the path in every record. Mixed mapping/scalar lists are not projected. Sanitization is collision-prone because spaces, dots, and hyphens all become underscores.
 
 4. **`Database` query gateway/router** — `yamlql_library/database.py`
   - Registers DataFrames in an in-memory DuckDB connection.
+  - Registration is all-or-cleanup for a database instance: if any relation fails to register, every relation registered by that call is unregistered before the error propagates.
+  - Stores `mapping_column_paths` and `table_doc_map` and passes them to all write handlers.
   - Executes SELECT/DDL directly and routes INSERT/UPDATE/DELETE to handlers after write-mode checks.
 
 5. **`SqlInterceptor` classifier** — `yamlql_library/sql_interceptor.py`
   - Uses sqlglot's DuckDB dialect to classify one statement as SELECT, INSERT, UPDATE, DELETE, DDL, or UNKNOWN.
 
 6. **CRUD command handlers** — `yamlql_library/crud_handlers.py`
-  - `InsertHandler` restores names/builds values with `ReverseTransformer`, resolves the mapping document that owns the target table, and uses `YamlWriter.append_item()` for list-backed tables. Root-list INSERT remains single-document only.
-  - `UpdateHandler` queries matching DuckDB rows, uses `_yaml_path` plus column maps, resolves the owning document, calls `set_value()` for fields, and uses guarded `set_root()` only for a single-document root update.
-  - `DeleteHandler` queries `_yaml_path`, sorts list indices highest-first, and calls document-resolving `YamlWriter.delete_value()`.
+  - All handlers reject `_yamlql_documents` writes, scalar/null document writes, loader/writer document-count disagreement, and document-kind disagreement. Qualified and root-list writes route through `table_doc_map` only; unqualified tables retain last-defining-document behavior.
+  - `InsertHandler` restores names/builds values with `ReverseTransformer`, groups compatible rows for one `append_items()` call, supports qualified mapping collections/nested child lists/root lists, and fails the statement rather than continuing after a row error.
+  - `UpdateHandler` queries matching DuckDB rows, uses `_yaml_path`, column maps, mapping paths, and typed document ownership, then applies guarded `set_value()` calls. Root-list scalar rows use their row path directly.
+  - `DeleteHandler` queries `_yaml_path`, groups compatible `(document, parent list)` targets, and uses `delete_values()`; ambiguous or non-list targets retain sequential highest-index-first deletion.
+  - Opt-in direct mapping columns accept JSON objects for INSERT/UPDATE and replace the mapping as a unit. Invalid JSON, non-object JSON, JSON null, SQL NULL, mapping/scalar kind changes, overlapping parent/child columns, merge-bearing mappings, and replacements that discard externally aliased descendant anchors fail with contextual `INSERT failed:` or `UPDATE failed:` policy messages and no file change.
   - Writer policy exceptions are converted to contextual INSERT/UPDATE/DELETE failures inside the transaction, causing rollback before any DuckDB synchronization attempt. A later DuckDB synchronization failure still leaves an already-committed YAML file authoritative and returns a reload warning.
   - One SQL write statement is one file transaction.
 
 7. **`ReverseTransformer` helper** — `yamlql_library/reverse_transformer.py`
-  - Restores original names and reconstructs nested dict/list values, chiefly for INSERT. It cannot recover stream/concrete-syntax information discarded by the read projection.
+  - Restores original names, uses explicit `mapping_column_paths`, and reconstructs nested dict/list values, chiefly for INSERT. It cannot recover stream/concrete-syntax information discarded by the read projection.
 
 8. **`YamlWriter` format-aware stream mutation adapter** — `yamlql_library/writer.py`
+  - Calls `check_ruamel_compatibility()` as the first statement of construction, before even checking the target path, so unsupported versions/capabilities cannot enter a write lifecycle.
   - Uses byte-based load/render/write APIs and owns a detected `FormatProfile`: mapping/sequence indentation and offset, LF/CRLF, UTF-8 BOM, explicit document start, and exact trailing-newline suffix.
-  - Exposes `documents`, `doc_count`, `find_document()`, backwards-compatible first-document `data`, `render()`, `write_to()`, `write()`, `append_item()`, guarded `set_root()`, and `doc=` addressing on path operations.
+  - Exposes `documents`, `doc_count`, `find_document()`, backwards-compatible first-document `data`, `render()`, `write_to()`, `write()`, `append_item()`, batch `append_items()`/`delete_values()`, public non-mutating `resolve_list_target()`, guarded `set_root()`, and `doc=` addressing on path operations.
   - Uses parser-event document spans and per-document source splicing. Unchanged documents and stream framing remain source bytes; a dirty document alone is rendered and replaced while preserving the stream tail newline.
-  - Uses top-level block restoration and source-range list deletion/append where round-trip dumping alone cannot preserve exact layout or comment ownership. Every source-range mutation reparses the updated bytes before another mutation uses line data.
+  - Uses top-level block restoration and source-range list deletion/append where round-trip dumping alone cannot preserve exact layout or comment ownership. Source-only splices make bytes authoritative and mark the tree stale; `_ensure_fresh_tree()` reparses lazily before any tree-aware operation, serialization, or comparison. Batch list edits validate first and perform one source transformation rather than one full-stream reparse per item.
+  - Resolves reused anchor names by source-event definition identity within a document: aliases bind to the nearest preceding same-name definition. It never resolves by name alone and raises `Cannot resolve anchor '<name>' identity in document <N>` when live tree/source events cannot be reconciled.
   - Preserves/adopts quote, block-scalar, flow/block, comment, tag, anchor, alias, and merge metadata under explicit policies. `YamlWriterPolicyError`, `AnchorInUseError`, `MergedKeyError`, and `NodeKindChangeError` make unsafe operations explicit.
   - Blocks mapping/sequence/scalar kind changes by default; only direct writer callers can opt in with `allow_kind_change=True`.
 
-9. **`TransactionManager` file unit of work** — `yamlql_library/transaction.py`
+9. **ruamel compatibility boundary** — `yamlql_library/ruamel_compat.py`
+  - Defines the certified range `ruamel.yaml>=0.18.0,<0.20` as `CERTIFIED_RANGE = ((0, 18, 0), (0, 20, 0))` and raises `YamlWriterCompatibilityError` outside it.
+  - A cached startup capability probe verifies the comment, line/column, anchor, merge, flow-style, formatting, and round-trip APIs on which the writer depends. Failed checks are not cached as success.
+  - Direct ruamel private-API dependence is confined to the writer/compatibility adapter boundary; callers receive explicit writer policy or compatibility failures.
+
+10. **`TransactionManager` file unit of work** — `yamlql_library/transaction.py`
   - Copies a `.backup`, mutates in memory, serializes through the transaction writer's `write_to()` to a same-directory temp file, validates all documents through ruamel `load_all()`, verifies document count, atomically replaces with `os.replace()`, and removes the backup.
-  - Performs a semantic comparison with the backup to detect direct mutation of `writer.data`/`writer.documents` that bypassed writer methods, then marks the affected document(s) dirty.
+  - Performs a semantic backup comparison only when writer dirty-state tracking has not already detected a change; this preserves direct `writer.data`/`writer.documents` mutation detection while removing redundant parses from normal dirty writes. The independent temp-file validation parse remains mandatory.
   - Rollback restores the backup after handler or commit errors.
 
-10. **CLI presentation** — `yamlql_library/cli.py`, `cli_logic.py`, `utils.py`
+11. **CLI presentation** — `yamlql_library/cli.py`, `cli_logic.py`, `utils.py`
    - Typer commands, prompt-toolkit interactive input, and Rich rendering.
+   - `--sql-file` decodes with `utf-8-sig`, accepting an optional UTF-8 BOM. Invalid UTF-8 exits non-zero with `SQL file <path> must be valid UTF-8.` and never falls back to a locale encoding.
    - Interactive `BEGIN` only queues SQL text; `COMMIT` executes each statement separately. It is not an atomic multi-statement file transaction.
 
-11. **Tests** — `tests/`
+12. **Tests** — `tests/`
   - Existing suites cover projection, paths/maps, classification, CRUD, CLI, and transaction behavior.
-  - `fidelity_utils.py` provides byte-exact helpers. Focused golden suites cover physical format, comment ownership, anchors/aliases/merges/tags, scalar and collection styles, kind guards, streams, and SQL end-to-end fidelity.
-  - `test_writer_multidoc.py` contributes 54 cases and `test_sql_fidelity_e2e.py` contributes 22 cases after parametrization.
-  - Verified suite state: 290 passed, 1 strict xfailed (SQL cannot target a flattened mapping as an updateable mapping column), and 1 pre-existing out-of-scope failure (`test_cli_sql_from_file_option_unicode`, SQL-file Unicode mojibake).
+  - `fidelity_utils.py` provides byte-exact helpers. Focused suites now also cover the compatibility guard, same-name anchors, lazy/batch writer behavior, canonical mapping columns, document-qualified tables/routing, and UTF-8 SQL files.
+  - `test_writer_performance.py` separates writer event/tree parse counts from the transaction validation parse and registers optional scale characterization under the `perf` marker.
 
 ### Internal Dependency Graph
 
@@ -88,7 +105,9 @@ CLI / Python caller -> YamlQL
                      `-> CRUD handlers
                           |-> ReverseTransformer
                           `-> TransactionManager
-                              `-> YamlWriter -> ruamel.yaml
+                              `-> YamlWriter
+                                  |-> ruamel_compat
+                                  `-> ruamel.yaml
 ```
 
 No network service, external database, authentication provider, message bus, or background worker exists.
@@ -96,9 +115,14 @@ No network service, external database, authentication provider, message bus, or 
 ### Read Data Flow
 
 ```text
-UTF-8 YAML -> text preprocessing -> PyYAML load_all(_ApplicationTagSafeLoader)
- -> Python objects -> DataTransformer
- -> DataFrames + _yaml_path + column maps
+UTF-8 YAML -> YamlLoader._load_documents()
+ -> PyYAML load_all(_ApplicationTagSafeLoader)
+ -> ordered (index, kind, data) stream
+ -> legacy later-wins merged mapping view + DataTransformer
+ -> DataFrames + _yaml_path + column maps + mapping_column_paths
+   + DocumentTableInfo/table_doc_map + warnings
+ -> legacy tables + optional canonical-JSON mapping columns
+   + document-qualified/root-list/metadata tables
  -> in-memory DuckDB -> SELECT/DDL -> DataFrame -> API/Rich output
 ```
 
@@ -107,21 +131,27 @@ UTF-8 YAML -> text preprocessing -> PyYAML load_all(_ApplicationTagSafeLoader)
 ```text
 DML SQL -> sqlglot classifier -> CRUD handler
  -> DuckDB validation/matching-row SELECT
- -> _yaml_path + original-name metadata
+ -> _yaml_path + original-name/mapping metadata + table_doc_map
  -> TransactionManager backup -> byte-based YamlWriter stream load
- -> owning-document resolution (last mapping document defining the top-level key)
- -> guarded path/root mutation or source-range list splice -> reparse after each splice
+ -> compatibility guard before writer construction
+ -> owning-document resolution (typed map for qualified tables;
+   last mapping document for legacy unqualified tables)
+ -> guarded path/mapping/root mutation or grouped append/delete batch
+ -> source splice with lazy tree refresh, or round-trip-node edit
  -> writer.write_to(same-filesystem temp)
  -> load_all validation + document-count check -> os.replace
- -> full YamlQL reload from disk
+ -> build a fresh stream/transform/database projection -> swap into YamlQL
 ```
 
-For an unqualified path in a multi-document stream, the writer and SQL handlers target the **last mapping document defining the path's top-level key**, matching the semantic loader's later-wins shallow merge. Direct writer callers may select a document explicitly with zero-based `doc=`. Non-mapping stream documents are preserved but are not SQL-addressable.
+For an unqualified path in a multi-document stream, the writer and SQL handlers target the **last mapping document defining the path's top-level key**, matching the semantic loader's later-wins shallow merge. Direct writer callers may select a document explicitly with zero-based `doc=`. Root-list stream documents are addressable only through qualified `doc{N}` relations; scalar and null documents are preserved but not writable through SQL.
+
+For a qualified relation, handlers use only `table_doc_map`; they do not parse `doc{N}` from a relation name. Root list documents are readable and writable as `doc{N}`. Scalar and null documents are represented only in `_yamlql_documents` and reject SQL DML. The metadata relation itself is read-only and intentionally has no `_yaml_path`.
 
 ### Consistency Model
 
 - YAML is authoritative; DuckDB is derived and ephemeral.
-- `YamlQL.query()` rebuilds all derived state after a successful write.
+- `YamlQL.query()` rebuilds all derived state after a successful write. Handler-level DuckDB view/table synchronization may warn because pandas registrations are views, but the facade reload replaces that state from authoritative YAML before returning normally.
+- A failed post-write reload is surfaced and leaves the facade with an empty database rather than stale relations. The already committed YAML remains authoritative.
 - Atomic replacement prevents torn files, not lost updates. No lock, source hash, or optimistic concurrency check exists.
 
 ---
@@ -135,27 +165,35 @@ For an unqualified path in a multi-document stream, the writer and SQL handlers 
 - **Command handlers**: INSERT, UPDATE, DELETE.
 - **Unit of Work**: one `TransactionManager` per write statement.
 - **Reload after write**: discard and rebuild derived state.
+- **Compatibility boundary**: all certified-range/capability checks and private ruamel assumptions stay in `ruamel_compat.py` and `writer.py`.
+- **Typed provenance**: `DocumentTableInfo`/`table_doc_map`, not relation-name parsing, governs document-qualified DML.
+- **Fail-closed policy**: ambiguous anchor identity, document ownership, mapping paths, or structural changes reject the whole statement.
+- **Additive/opt-in read model**: legacy unqualified relations and flattened columns remain the default; mapping-valued JSON columns require `expose_mapping_columns=True`; multi-document collection relations are additive.
 
 ### Paths and Naming
 
 - `_yaml_path` is reserved mutation metadata, synthetically rooted at `root` (for example, `root.users.0`).
 - Handlers strip `root.` before writer calls.
 - SQL names replace spaces, dots, and hyphens with underscores; `column_name_map` attempts to restore original names.
+- `doc{N}_{table}` and `doc{N}` are public qualified relation conventions, but handlers must never infer ownership by parsing those names.
+- `_yamlql_documents` is a reserved, read-only metadata relation for document index/kind/key/table discovery.
+- Direct mapping columns retain their sanitized mapping path name, are appended after legacy columns, and are tracked separately in `mapping_column_paths`.
 
 ### Cross-Cutting Concerns
 
 - **Authentication/authorization**: none; authority comes from process/filesystem permissions.
 - **Write safety**: mode `r` is default; DML requires `rw`/`w` or CLI `--writable`.
 - **Parsing security**: PyYAML uses a dedicated `SafeLoader` subclass for `load_all()`; application tags are reduced to safe plain values, the core tag namespace is not accepted by the fallback, and global loader state is unchanged.
-- **Errors**: database permission/config errors raise; handlers return structured results; CLI catches/renders errors. The writer has a focused safety-policy exception hierarchy (`YamlWriterPolicyError` and specific anchor, merge, and kind-change errors), not a system-wide domain exception hierarchy.
-- **Observability**: Rich, warnings, and occasional stderr; no structured logs, metrics, traces, or audit journal.
+- **Errors**: database permission/config errors raise; handlers return structured results and wrap DML failures as `INSERT/UPDATE/DELETE failed:`; CLI catches/renders errors. The writer has a focused safety-policy exception hierarchy (`YamlWriterPolicyError` and specific compatibility, anchor, merge, and kind-change errors), not a system-wide domain exception hierarchy.
+- **Observability**: Rich, Python warnings, `YamlQL.warnings`, and occasional stderr; no structured logs, metrics, traces, or audit journal.
 - **Configuration**: constructor arguments, CLI options, environment variables, and `.env` loading.
 - **Secrets**: no redaction; query output can expose source values.
 - **Concurrency**: no locking/conflict detection.
 
 ### Packaging and Infrastructure
 
-- setuptools package, Python `>=3.9`, console entry `yamlql_library.cli:main`.
+- setuptools package, Python `>=3.9`, console entry `yamlql_library.cli:main`, and certified dependency `ruamel.yaml>=0.18.0,<0.20`.
+- pytest registers `perf` for optional performance characterization.
 - `.github/workflows/documentation.yml` deploys MkDocs documentation.
 - No package-test workflow, runtime service/container deployment, or persistent database infrastructure was found.
 
@@ -166,16 +204,20 @@ For an unqualified path in a multi-document stream, the writer and SQL handlers 
 ### Guaranteed and Tested
 
 - **No-op and minimal-diff physical fidelity**: byte-based I/O preserves LF/CRLF, UTF-8 BOM, detected mapping/sequence indentation and offset, explicit start markers, and exact trailing-newline suffix. Golden tests cover no-op writes and targeted SQL edits.
-- **Source-aware list editing**: block-list deletion removes comments owned by the deleted item; append inserts before post-list comments. Source-range splices are immediately reparsed so later edits use current line/column data.
+- **Source-aware list editing**: block-list deletion removes comments owned by the deleted item; append inserts before post-list comments. Source-range splices invalidate parsed locations and trigger a lazy refresh before another tree-aware edit uses them.
+- **Batch and lazy list editing**: `append_items()` and `delete_values()` validate a complete batch before mutation and apply compatible rows as one transformation. Source-only splices defer tree rebuilding until a tree-aware consumer requires it; deterministic tests bound writer reparsing independently of the mandatory transaction validation parse.
 - **Comment and style behavior**: focused tests cover mapping/list comment ownership, inline comments beside anchors, single/double quotes, literal/folded block scalars and chomping, safe quoting of type-looking strings, flow/block collections, and sibling-style adoption for new values.
-- **Anchor/alias/merge/tag policy**: updating an anchor definition reconnects aliases; updating an alias occurrence replaces only that occurrence; deleting an anchor still in use fails; deleting a merge-only key fails while setting it creates an own-key override; application tags open safely on the read path and survive tested writes.
+- **Anchor/alias/merge/tag policy**: updating an anchor definition reconnects aliases; updating an alias occurrence replaces only that occurrence; deleting an anchor still in use fails; deleting a merge-only key fails while setting it creates an own-key override; application tags open safely on the read path and survive tested writes. Same-name anchors are grouped by nearest-preceding definition event within their document, and unresolved identity fails closed.
 - **Structural guard**: mapping/sequence/scalar kind changes fail by default with `NodeKindChangeError`; direct writer code must explicitly pass `allow_kind_change=True`. SQL surfaces the failure context and leaves the file unchanged.
 - **Multi-document write preservation**: the writer models all documents, parser events define safe source spans, only dirty document bodies are spliced, and transaction validation parses all documents and checks count. `documents`, `doc_count`, `find_document()`, and zero-based `doc=` are tested.
-- **SQL stream addressing**: SQL targets the last mapping document defining the top-level key, consistent with the read loader's later-wins merge. Untouched documents, directives/comments around document boundaries, block-scalar separator text, BOM, and stream tail newlines are covered by byte-exact tests.
+- **SQL stream addressing**: legacy SQL targets the last mapping document defining the top-level key, while typed `table_doc_map` routes `doc{N}_{table}`, nested-child, and root-list relations. Untouched documents, directives/comments around boundaries, BOM, line endings, and stream tails are covered by byte-exact tests.
+- **Document discovery**: `_yamlql_documents` exposes ordered document kind and generated relations without making scalar/null roots writable. `YamlQL.warnings` reports skipped derived/metadata tables on collisions.
+- **Mapping-valued writes**: opt-in canonical-JSON columns make whole mappings addressable without removing flattened child columns. Parent/child conflicts and unsafe replacement shapes fail before persistence.
+- **Certified writer startup**: writer construction checks `ruamel.yaml>=0.18.0,<0.20` and required capabilities before any file mutation path is entered.
+- **SQL-file decoding**: CLI SQL files are explicitly UTF-8 with optional BOM; invalid bytes fail rather than producing locale-dependent mojibake.
 - **Transactional serialization**: commit uses the same loaded writer's `write_to()` and format profile; semantic dirty checking catches direct `writer.data`/`documents` mutations. One statement retains backup/temp/validate/atomic-replace behavior.
-- **Evidence**: the focused tests include 54 multi-document and 22 SQL fidelity cases; the complete run is 290 passed, 1 strict xfailed, plus the known baseline failure below.
 
-These guarantees make the write path a robust format-preserving **row-level YAML editor**. They do not make the lossy SQL projection a general concrete-syntax or arbitrary structural editor.
+These guarantees make the write path a robust format-preserving **row- and mapping-level YAML editor with qualified document addressing**. They do not make the semantic SQL projection a general concrete-syntax or arbitrary structural editor.
 
 ### Resolved Previous Findings
 
@@ -184,16 +226,22 @@ These guarantees make the write path a robust format-preserving **row-level YAML
 - Resolved: single-document mutation/validation and inaccurate multi-document preservation claims.
 - Resolved: missing anchor/alias/merge policy, custom application-tag tolerance, style-focused coverage, and silent node-kind replacement.
 - Resolved: transaction commit constructing a second default-configured writer.
+- Resolved: unverified ruamel range; packaging, runtime version checks, and a capability probe now share the certified `>=0.18.0,<0.20` boundary.
+- Resolved: per-row source-splice reparsing for compatible multi-row INSERT/DELETE; handlers use batch writer calls and the writer refreshes lazily.
+- Resolved/re-scoped: same-name anchors now use document-scoped source identity; only the explicit G4 ambiguity remains.
+- Resolved: Unicode `--sql-file` mojibake through explicit UTF-8/BOM decoding.
+- Resolved/re-scoped: mapping-valued nodes and multi-document/root-list collections can be made SQL-addressable without removing legacy relations.
 
 ### Verified Limitations and Risks
 
 1. **The SQL read model remains lossy and shape-dependent**
   - PyYAML values are transformed into DataFrames; comments, styles, tags, anchor/alias identity, merge provenance, and source locations do not enter the relational model.
-  - Mapping flattening, first-record nested-list discovery, all-record path requirements, unsupported mixed lists, and scalar-list stringification limit reachability and fidelity. The one strict xfail records that SQL cannot target a flattened mapping as an updateable mapping node.
+  - Mapping flattening, first-record nested-list discovery, all-record path requirements, unsupported mixed lists, and scalar-list stringification limit reachability and fidelity.
+  - Direct mapping columns are opt-in (`expose_mapping_columns=False` by default) to preserve legacy schemas and positional INSERT behavior. Whole-map replacement intentionally discards child comments/styles and rejects merge-bearing or externally aliased descendants.
 
-2. **Document visibility remains asymmetric**
-  - Mapping documents are shallow-merged for SQL with later top-level keys winning. Non-mapping documents are preserved by the writer but invisible and unaddressable to SQL.
-  - SQL does not expose arbitrary document indexes; its addressing rule is the last document defining the top-level key. Direct writer callers can use `doc=`.
+2. **Document visibility is additive, not a replacement for the legacy merge**
+  - Unqualified mapping tables still use the shallow-merged later-wins view for compatibility. Qualified relations add per-document mapping collections and root lists only when a multi-document stream has queryable collections.
+  - Scalar/null roots are metadata-only; arbitrary scalar-root replacement is not exposed as SQL DML. A real user table colliding with a generated `doc{N}_...` or `_yamlql_documents` name wins and the derived relation is skipped with a warning.
 
 3. **Updated numeric/boolean literal spelling is not preserved**
   - Unchanged nodes stay source bytes, but replacing values can normalize lexical forms such as hexadecimal, underscores, or YAML 1.1 boolean spellings.
@@ -210,28 +258,30 @@ These guarantees make the write path a robust format-preserving **row-level YAML
 7. **Interactive `BEGIN`/`COMMIT` is not one atomic file transaction**
   - Queued SQL statements execute as separate transactions. Failure at operation $n$ leaves operations $1..n-1$ committed.
 
-8. **ruamel private-internals dependency**
-  - Comment, anchor, merge, flow-style, line/column, and tag behavior uses ruamel internals verified on 0.19.1, while `pyproject.toml` still pins only `ruamel.yaml>=0.18.0`. Compatibility across that declared range is not established.
+8. **ruamel private-API dependence remains inside a certified boundary**
+  - Comment, anchor, merge, flow-style, line/column, and tag behavior still depends on ruamel implementation details. The runtime guard and capability probe reduce risk within `>=0.18.0,<0.20`; they do not turn those details into stable public APIs or certify future `0.20+` releases.
 
-9. **Per-edit reparse cost**
-  - Source-range list delete/append reparses the complete stream after each mutation to make subsequent source locations safe. Large files or large multi-row edits can therefore incur repeated parse cost.
+9. **Whole-statement latency remains parse-bound**
+  - Batch edits remove reparsing proportional to row count, but initial round-trip load, source-splice validation/event parsing where required, the independent transaction temp-file validation parse, and the facade's semantic reload remain. No blanket sub-second guarantee exists for large documents.
 
-10. **Same-name anchor redefinition risk**
-   - Anchor policy helpers locate occurrences by anchor name and rely on ruamel object/location behavior. YAML permits anchor-name reuse, especially across document scopes; same-name redefinitions are not proven safe for all mutation paths.
+10. **G4 same-name-anchor multi-row UPDATE limitation**
+  - If one multi-row UPDATE first turns an alias in one same-name anchor group into a literal and then edits a definition in another group, the immutable event list and live tree no longer align unambiguously. The writer rejects the statement with `Cannot resolve anchor '<name>' identity in document <N>` and leaves the file unchanged rather than guessing.
 
-11. **Baseline Unicode SQL-file failure**
-   - `test_cli_sql_from_file_option_unicode` still produces mojibake when reading Unicode SQL text from a file. This predates the complex YAML writer work and remains out of scope.
+11. **DuckDB view/table synchronization warnings can occur after writes**
+  - Pandas registrations are DuckDB views. Handler-local INSERT/UPDATE/DELETE synchronization or table recreation can warn/fail after YAML has already committed. Normal facade writes immediately rebuild DuckDB from YAML; direct handler callers must heed the warning and reload.
 
-12. **Derived table-to-node mapping remains incomplete**
-   - Top-level list tables and existing `_yaml_path` rows are supported, but deeply derived table names are not a general stable YAML-node identity scheme.
+12. **Derived paths are still not stable node identities**
+  - `table_doc_map` makes document ownership typed, but `_yaml_path`, sanitized column names, and derived nested-table paths remain shape-dependent strings. They do not solve dotted/numeric key ambiguity or all sanitization collisions.
+
+13. **Comment-only stream alignment is intentionally narrow**
+  - Empty bytes mean zero documents, while any non-empty whitespace/comment-only content—including tab-only blank lines—is treated as one null document to align PyYAML projection with the round-trip writer. No SQL relation is invented for that null document.
 
 ### Recommended Next Architectural Steps
 
-- Unify the semantic projection with the round-trip stream or retain explicit document/node identities through transformation.
-- Replace string dot paths with typed path segments or stable node IDs and detect sanitized-name collisions.
+- Replace string `_yaml_path`/dot paths with typed path segments or stable node IDs while retaining `table_doc_map` for document ownership, and detect sanitized-name collisions.
 - Add content-hash/file-metadata concurrency checks and one in-memory unit of work for atomic interactive batches.
-- Pin/test a supported ruamel version range and add performance tests for repeated source-splice reparsing.
-- Scope anchor searches to the selected document and explicitly test same-name anchor redefinitions.
+- Re-certify the ruamel matrix on dependency upgrades and keep all new private-API access behind the compatibility boundary.
+- Reduce remaining initial-load/validation costs only with explicit performance evidence; do not weaken transaction validation.
 
 ---
 
@@ -253,6 +303,12 @@ No graphical UI exists. CLI conventions use Rich tables/lists, green success, re
 - ❌ Never assume a sanitized SQL name uniquely identifies a YAML key.
 - ❌ Never claim exact format preservation from semantic equality or one retained comment.
 - ❌ Never mutate from stale source locations after a source splice.
+- ❌ Never serialize, compare, or validate a stale writer tree; refresh it or use authoritative source bytes through the writer contract.
+- ❌ Never resolve an anchor or alias by name alone, cross document boundaries, or continue after anchor identity becomes ambiguous.
+- ❌ Never construct `YamlWriter` through a path that bypasses its compatibility guard.
+- ❌ Never access additional ruamel private APIs outside `writer.py` and `ruamel_compat.py`.
+- ❌ Never infer a qualified table's document by parsing `doc{N}` from its name; use `table_doc_map`.
+- ❌ Never permit DML against `_yamlql_documents` or scalar/null document roots.
 - ❌ Never describe interactive queued statements as one atomic transaction.
 - ❌ Never build a complex editor solely on DataFrames.
 - ❌ Never run two pytest processes against this repository at once; shared files and resource contention can make the result unreliable.
@@ -265,10 +321,16 @@ No graphical UI exists. CLI conventions use Rich tables/lists, green success, re
 - ✅ Always retain path and reversible-name metadata for mutation targeting.
 - ✅ Always delete multiple list indices highest-first.
 - ✅ Always resolve unqualified stream paths to the last mapping document defining the top-level key; use explicit `doc=` when a direct caller intends another document.
-- ✅ Always splice source ranges for fidelity-sensitive list edits when locations are trustworthy, and reparse after every such mutation before using line data again.
+- ✅ Always route qualified relations with typed `DocumentTableInfo`/`table_doc_map`, and validate loader/writer document count and root kind before mutation.
+- ✅ Always scope anchors to their selected document and reject unresolved source-definition identity with the standard policy error.
+- ✅ Always invoke the ruamel version/capability guard as the first action of writer construction.
+- ✅ Always pre-validate list batches and mapping parent/child conflicts before mutating transaction state.
+- ✅ Always splice source ranges for fidelity-sensitive list edits when locations are trustworthy, and lazily refresh before any operation needs current tree/location data.
 - ✅ Always enforce writer anchor/merge/kind-change policy before persistence and let failures roll back before DuckDB synchronization.
 - ✅ Always use same-filesystem temp serialization, `load_all()` validation, document-count verification, and atomic replacement.
 - ✅ Always use explicit UTF-8 byte I/O and preserve the detected format profile.
+- ✅ Always decode CLI `--sql-file` input as `utf-8-sig` and fail clearly on invalid UTF-8; never use locale fallback.
+- ✅ Always replace the derived database after a successful write; if reload fails, expose the error and leave no stale relations registered.
 - ✅ Always add byte-exact golden tests for write behavior; semantic reparse assertions alone are insufficient.
 
 ---
@@ -286,6 +348,7 @@ No graphical UI exists. CLI conventions use Rich tables/lists, green success, re
   /crud_handlers.py                -> DML handlers
   /reverse_transformer.py          -> Partial reverse projection
   /writer.py                       -> Format/source-aware ruamel stream mutation adapter
+  /ruamel_compat.py                -> Certified version/capability boundary for writer internals
   /transaction.py                  -> Atomic stream-aware file unit of work
   /cli.py / cli_logic.py / utils.py -> CLI presentation
 /tests/test_yamlql.py              -> Core/writer/transaction/CLI tests
@@ -295,9 +358,15 @@ No graphical UI exists. CLI conventions use Rich tables/lists, green success, re
 /tests/test_writer_comments.py     -> Comment ownership/source-splice tests
 /tests/test_writer_anchors_tags.py -> Anchor/alias/merge/tag policy tests
 /tests/test_writer_styles.py       -> Scalar/collection style tests
-/tests/test_writer_type_guard.py   -> Node-kind policy tests (one strict xfail)
+/tests/test_writer_type_guard.py   -> Node-kind and mapping-replacement policy tests
 /tests/test_writer_multidoc.py     -> Document-stream fidelity/addressing tests
 /tests/test_sql_fidelity_e2e.py    -> Complex SQL write-path golden tests
+/tests/test_ruamel_compat.py       -> Certified-range and capability-guard tests
+/tests/test_writer_same_anchor.py  -> Reused-anchor identity and rejection tests
+/tests/test_writer_performance.py  -> Batch/lazy parse-count and optional timing tests
+/tests/test_sql_read_model.py      -> Mapping-column compatibility and write-policy tests
+/tests/test_sql_documents.py       -> Stream projection, qualified routing, and byte-identity tests
+/tests/test_cli_sql_file_encoding.py -> UTF-8/BOM SQL-file regression tests
 /tests/test_data/                  -> YAML fixtures
 /docs/guides/crud-operations.md    -> CRUD behavior, policies, and limits
 /docs/guides/transaction-safety.md -> Transaction and write-fidelity guarantees
@@ -306,12 +375,27 @@ No graphical UI exists. CLI conventions use Rich tables/lists, green success, re
 /build/                            -> Stale generated copy; excluded
 ```
 
-- Naming: snake_case modules/functions, PascalCase classes, `test_<behavior>` tests.
+- Naming: snake_case modules/functions, PascalCase classes, `test_<behavior>` tests, zero-based `doc{N}` qualified relations, and reserved `_yamlql_documents` metadata.
 - Tests should mutate temporary files, reopen `YamlQL` to verify persistence, and assert source text/golden files for syntax-fidelity requirements.
 
 ---
 
 ## Change History
+
+### 2026-10-03 — Workflow B: Guarded, Batched, Document-Aware SQL Editing
+
+- Added `ruamel_compat.py` with `YamlWriterCompatibilityError`, a cached capability probe, and the certified `ruamel.yaml>=0.18.0,<0.20` range; writer construction now guards before any other action.
+- Replaced name-only anchor handling with document-scoped source-definition identity and fail-closed ambiguity handling; retained the documented G4 multi-row UPDATE limitation.
+- Added lazy writer tree refresh, atomic batch `append_items()`/`delete_values()`, and public `resolve_list_target()`; compatible multi-row INSERT/DELETE operations now batch by list/document.
+- Added canonical-JSON mapping-column projection/write policy behind opt-in `expose_mapping_columns`, including explicit path metadata and mapping-replacement safety checks.
+- Added ordered loader stream semantics, document-qualified/root-list relations, read-only `_yamlql_documents`, `DocumentTableInfo`/`table_doc_map`, and collision warnings.
+- Updated the facade to derive merged and stream views from one parse, expose `YamlQL.warnings`, rebuild the database after writes, and leave an empty database rather than stale relations after failed reload.
+- Made database relation registration clean up partial registrations and handed typed routing/mapping metadata to handlers.
+- Fixed CLI SQL-file decoding to UTF-8 with optional BOM and explicit invalid-UTF-8 failure.
+- **Drift**: positive/neutral evolution. Existing facade/adapters/handlers/unit-of-work boundaries remain intact; new compatibility and typed-provenance metadata are contained within their owning layers.
+- **Concern**: implementation complexity and reliance on guarded ruamel internals increased, and handler-local DuckDB view synchronization warnings remain. `table_doc_map` improves document ownership but `_yaml_path` is still string- and shape-based.
+- **Drift Score**: 15/100 (low, deliberate evolution; no negative boundary drift detected).
+- Confidence: 100%.
 
 ### 2026-10-02 — Complex YAML Editor Write Path
 
@@ -345,9 +429,10 @@ No graphical UI exists. CLI conventions use Rich tables/lists, green success, re
 - Packaging/infrastructure intent: 20/20.
 - Cross-cutting concerns: 20/20.
 - **Known Unknowns**:
-  - Advanced behavior on ruamel versions other than the verified 0.19.1 remains unknown because the declared dependency floor is 0.18.0.
-  - Same-name anchor redefinitions and performance on large streams with many source-splice edits need dedicated evidence.
-  - The supplied final suite result was cross-checked against the focused test inventory and code paths; this update did not launch another test process.
+  - Future ruamel `0.20+` behavior is intentionally unknown and rejected until separately certified; private APIs can still vary inside the declared range despite the startup probe.
+  - Whole-statement timing on large streams remains environment- and parse-bound; the architecture claims constant-in-row-count batch reparsing, not universal sub-second completion.
+  - Mapping/direct-child sanitization collisions and typed stable node identity remain unresolved.
+  - This architecture update re-scanned authoritative sources and focused tests. No terminal capability was available in this mode to independently execute `git diff HEAD --stat` or rerun the suite; change-scope and behavior claims were therefore validated from the current workspace and plan bundle.
 
 <!-- LEGACY REPORT BELOW IS QUARANTINED: it predates the current source and contains contradicted claims.
 

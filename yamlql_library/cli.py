@@ -108,8 +108,14 @@ def sql_command(
     mode = "rw" if writable else "r"
     
     if sql_file:
-        with open(sql_file, 'r') as f:
-            sql_query_str = f.read().strip()
+        try:
+            with open(sql_file, "r", encoding="utf-8-sig") as f:
+                sql_query_str = f.read().strip()
+        except UnicodeDecodeError:
+            rich.print(
+                f"[bold red]Error:[/bold red] SQL file {sql_file} must be valid UTF-8."
+            )
+            raise typer.Exit(code=1)
         cli_logic.run_query(sql_query_str, file, output, max_depth, strategy, mode)
     elif sql_query:
         sql_query_str = " ".join(sql_query)

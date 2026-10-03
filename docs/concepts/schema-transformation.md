@@ -9,6 +9,29 @@ You can select a transformation strategy using the `--strategy` flag in the `dis
 *   **`--strategy depth` (Default):** Best for predictable, consistently structured files.
 *   **`--strategy adaptive`:** Best for complex, nested, or inconsistently structured files.
 
+## Mapping-valued fields
+
+Flattened mapping fields remain the default schema. Python callers can opt in
+to direct mapping columns with `YamlQL(path, expose_mapping_columns=True)`.
+The added columns are canonical JSON objects: sorted keys, compact separators,
+unescaped non-ASCII text, ISO-8601 dates/times, sorted set arrays, and base64
+bytes. Values that cannot be represented as JSON are `NULL`.
+
+`YamlQL.warnings` exposes document-derived-table and metadata-table collision
+warnings (for example, when a user table already uses a generated name).
+The transformer appends these columns after the existing schema and skips one
+when its name collides with a legacy scalar or flattened column. A direct
+mapping column accepts only a JSON object on write. The replacement renders in
+the writer's style but does not retain child comments, quote styles, or child
+tags. Wrong-kind values, merge keys, aliased descendants, and parent/child
+column conflicts are rejected before the transaction writes the file.
+
+For streams with document collections, the legacy unqualified tables keep
+later-definition-wins behavior. Additional mapping tables are named
+`doc{N}_{table}`; root-list tables are `doc{N}` and may have child tables.
+`_yamlql_documents` provides read-only document metadata. Scalar and null
+documents have no writable SQL relation.
+
 ---
 
 ## `depth` Strategy (Default)

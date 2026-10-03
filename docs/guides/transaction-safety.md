@@ -173,8 +173,25 @@ Numeric and boolean literal spelling is not guaranteed after an update.
     Python API offers `allow_kind_change=True`.
 - Atomic replacement prevents torn files, not lost updates. YamlQL has no
     lock, source hash, or other concurrency control.
-- The SQL read model is lossy: it shallow-merges mapping documents and does
-    not expose document boundaries or non-mapping documents.
+- In multi-document streams, use `doc{N}_{table}` for a mapping table or
+    `doc{N}` for a root-list table when a statement must target one document.
+    `_yamlql_documents` is read-only; scalar and null documents cannot be
+    written through SQL. Unqualified tables continue to use later-definition-
+    wins behavior.
+- The writer is certified for `ruamel.yaml>=0.18.0,<0.20` (0.18.0, 0.18.17,
+    0.19.0, and 0.19.1). A version guard and capability probe run before any
+    write.
+
+## Batch statements and timing
+
+Compatible multi-row INSERT and DELETE statements for one list in one document
+use one batch writer call; incompatible groups use the existing grouped or
+sequential path. Batch errors fail the whole statement before commit. Recorded
+single-row INSERT timings were 0.002100 s / 2.169384 s / 1.752429 s at 500
+items and 0.002551 s / 7.750668 s / 4.805445 s at 1,000 items (writer edit /
+first refresh / whole statement). The refresh was super-linear in this run,
+and no 5,000-item timing was recorded. Whole-statement latency is parse-bound,
+not sub-second.
 
 ## Recovery Strategies
 

@@ -1,0 +1,80 @@
+# Synthetic Power Apps screen fixture.
+Screens:
+  scrNew:
+    Properties:
+      OnVisible: |
+        Set(varGreeting, "Hello, café");
+        Notify("Ready, it's safe", NotificationType.Success)
+      OnHidden: |-
+        Set(varGreeting, "")
+      Fill: =RGBA(245, 245, 245, 1)
+      Title: "New request"
+      Version: 2
+      Enabled: true
+      OptionalValue: null
+    Children:
+      # Main body container.
+      - cnt_body:
+          Control: Container@2.5.0
+          Properties:
+            Fill: =RGBA(255, 255, 255, 1)
+            LayoutDirection: Vertical
+          Children:
+            - cnt_level1:
+                Control: Container@2.5.0
+                Properties:
+                  Padding: 8
+                Children:
+                  - cnt_level2:
+                      Control: Container@2.5.0
+                      Properties:
+                        Padding: 8
+                      Children:
+                        - cnt_level3:
+                            Control: Container@2.5.0
+                            Properties:
+                              Padding: 8
+                            Children:
+                              - cnt_level4:
+                                  Control: Container@2.5.0
+                                  Properties:
+                                    Padding: 8
+                                  Children:
+                                    - cnt_level5:
+                                        Control: Container@2.5.0
+                                        Properties:
+                                          Padding: 8
+                                        Children:
+                                          - cnt_level6:
+                                              Control: Container@2.5.0
+                                              Properties:
+                                                Padding: 8
+                                              Children:
+                                                - cnt_level7:
+                                                    Control: Container@2.5.0
+                                                    Properties:
+                                                      Padding: 8
+                                                    Children:
+                                                      - lbl_title:
+                                                          Control: Label@2.5.1
+                                                          Properties:
+                                                            Text: "Welcome, café"
+                                                            Color: =RGBA(10, 20, 30, 1)
+                                                      - rect_divider:
+                                                          Control: Rectangle@2.3.0
+                                                          Properties:
+                                                            Fill: =RGBA(0, 120, 212, 1)
+      - btn_save:
+          Control: Button@2.2.0
+          Properties:
+            Text: "Save request"
+            OnSelect: =Notify("Saved, it's done", NotificationType.Success)
+            Visible: true # Inline control comment.
+      - frm_details:
+          Control: Form@2.4.0
+          Properties:
+            DataSource: "Requests"
+            Item: =Defaults(Requests)
+            Columns: 3
+            SubmitEnabled: false
+# Trailing fixture comment.

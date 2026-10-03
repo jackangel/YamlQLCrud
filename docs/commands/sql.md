@@ -25,7 +25,7 @@ yamlql sql -f file.yml "SELECT * FROM table_name"
 |---|---|---|
 | `--file`, `-f` | YAML file to query | Required |
 | `--output`, `-o` | Output format (`auto`, `table`, `list`) | `auto` |
-| `--sql-file` | Path to a file containing the SQL query. | None |
+| `--sql-file` | Path to a UTF-8 file containing the SQL query. A leading UTF-8 BOM is accepted. | None |
 | `--strategy` | The table creation strategy to use (`depth` or `adaptive`). | `depth` |
 | `--max-depth`| Maximum recursion depth for the `depth` strategy. | `5` |
 
@@ -92,6 +92,13 @@ For complex queries or to avoid shell quoting issues, use the `--sql-file` optio
 
 ```bash
 yamlql sql -f file.yml --sql-file myquery.sql
+```
+
+SQL files are always decoded as UTF-8; YamlQL does not fall back to the
+system locale. An invalid file is rejected before the query runs:
+
+```text
+Error: SQL file <path> must be valid UTF-8.
 ```
 
 ## Query Examples

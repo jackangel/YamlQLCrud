@@ -139,13 +139,6 @@ def test_sql_update_rejects_list_to_scalar_and_null_without_file_changes(tmp_pat
         yamlql.close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "The projection flattens mapping fields and does not expose an updateable "
-        "mapping column, so SQL cannot reach the writer kind guard."
-    ),
-)
 def test_sql_update_rejects_mapping_to_scalar_without_file_changes(tmp_path):
     source = to_lf(
         "users:\n"
@@ -156,19 +149,18 @@ def test_sql_update_rejects_mapping_to_scalar_without_file_changes(tmp_path):
         "      enabled: true\n"
     )
     yaml_path = write_bytes(tmp_path / "mapping-column.yaml", source)
-    yamlql = YamlQL(str(yaml_path), mode="rw")
+    yamlql = YamlQL(str(yaml_path), mode="rw", expose_mapping_columns=True)
     try:
-        with pytest.raises(Exception) as error:
+        with pytest.raises(
+            Exception, match="UPDATE failed:.*details.*mapping.*scalar"
+        ):
             yamlql.query("UPDATE users SET details = 'replacement' WHERE id = 1")
         assert_bytes_equal(read_bytes(yaml_path), source)
-        selected = yamlql.query("SELECT details_region, details_enabled FROM users WHERE id = 1")
+        selected = yamlql.query(
+            "SELECT details_region, details_enabled FROM users WHERE id = 1"
+        )
         assert selected.iloc[0]["details_region"] == "west"
         assert selected.iloc[0]["details_enabled"]
-        assert "Column 'details' does not exist" in str(error.value)
-        pytest.fail(
-            "The SQL projection does not expose mapping field 'details', so the "
-            "writer kind guard is unreachable through UPDATE."
-        )
     finally:
         yamlql.close()
 

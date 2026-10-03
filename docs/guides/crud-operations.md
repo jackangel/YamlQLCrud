@@ -133,10 +133,11 @@ UPDATE products SET discount = 0.2 WHERE price BETWEEN 100 AND 500
 
 An SQL `UPDATE` cannot replace a mapping or sequence with a scalar (including
 `NULL`), or replace a scalar with a mapping or sequence. The statement fails
-before the file is committed. The underlying writer error has this exact shape:
+before the file is committed. SQL reports the writer's kind error inside an
+`UPDATE failed:` message, for example:
 
 ```text
-Refusing to change node at '<path>' from <kind> to <kind> (<PythonType>); pass allow_kind_change=True to override
+UPDATE failed: Cannot update table '<table>', row '<path>', column '<column>': Refusing to change node at '<path>' from <kind> to <kind> (<PythonType>); pass allow_kind_change=True to override
 ```
 
 There is no SQL opt-in for this. Python users of `YamlWriter` can explicitly
@@ -285,9 +286,50 @@ a claim that arbitrary YAML source syntax is preserved unchanged.
 | Comments | A comment block directly above an item with no blank line, and that item's end-of-line comment, are deleted with the item. Blank-line-separated blocks and comments before the next top-level key remain. |
 | Anchors and aliases | Updating an anchored definition retains its anchor and updates aliases. Updating an alias occurrence replaces only that occurrence with a literal. Deleting an anchor still referenced by aliases is rejected. |
 | Merge keys and tags | Setting an inherited merge-only key adds an own-key override; deleting that merge-only key is rejected. Tested custom tags, including `!Ref`, remain readable on the SQL read path and remain intact when another node is updated. |
-| Document streams | Writer edits preserve untouched documents. An unqualified path targets the last mapping document defining its top-level key; non-mapping documents are preserved by the writer but are not SQL-addressable. |
+| Document streams | Writer edits preserve untouched documents. An unqualified path targets the last mapping document defining its top-level key. Qualified tables target one document; scalar and null documents are preserved but are not writable through SQL. |
 
 No rename, move, or set-comment SQL/Python editing APIs are provided.
+
+### Reused anchor names
+
+Within a document, aliases with a reused anchor name bind to the nearest
+preceding definition of that name. Anchor identity is document-scoped. A
+statement is rejected rather than guessed when identity cannot be established:
+
+```text
+Cannot resolve anchor '<name>' identity in document <N>
+```
+
+The transaction then leaves the file unchanged. One accepted limitation is a
+multi-row `UPDATE` that first turns an alias in one same-name-anchor group into
+a literal and then edits a definition in another group: it is rejected with
+that policy error rather than attempting to infer the changed group.
+
+## Mapping-valued columns
+
+Mapping-valued fields retain the existing flattened columns by default. To add
+direct mapping columns, construct the Python API with
+`YamlQL(path, expose_mapping_columns=True)`. Each added column contains a
+canonical JSON object: keys are sorted, separators are compact, non-ASCII text
+is kept, dates and times use ISO-8601, sets become sorted arrays, and bytes
+become base64 text. A value without a JSON form is `NULL`. A mapping column is
+skipped when its name collides with an existing scalar or flattened column.
+
+Writing one of these columns requires a JSON object. It replaces the YAML
+mapping in the writer's local style. Child comments, child quote styles, and
+child tags are not retained by this replacement. Invalid JSON, JSON of another
+kind, text `null`, and SQL `NULL` reach the mapping-to-non-mapping kind guard
+inside `UPDATE failed:`. Replacements containing a merge key, replacements
+that would discard an aliased descendant, and parent/child column conflicts
+are rejected before a write.
+
+## Document-qualified tables
+
+For a multi-document stream, mapping tables are also available as
+`doc{N}_{table}`. A root-list document is `doc{N}` and can also expose child
+tables. `_yamlql_documents` lists document metadata and is read-only. Qualified
+writes modify only the selected document. Existing unqualified tables retain
+their merged, later-definition-wins behavior.
 
 ## Common Patterns
 
@@ -339,17 +381,44 @@ COMMIT
 
 ## Limits of the SQL model
 
-- The SQL read model is lossy: mapping-valued fields are flattened into
-  columns, so a mapping-valued field cannot be set to a scalar through SQL.
-  Mapping documents are shallow-merged on read; document boundaries and
-  non-mapping documents are not represented by SQL.
+- Mapping columns are opt-in and replace a complete mapping only; they do not
+  preserve child-level presentation metadata during replacement.
 - SQL column names can collide after sanitization. Dots and numeric segments
   in YAML keys are ambiguous in dot paths.
-- Only top-level-key tables are addressed for `INSERT`; root-level lists in
-  multi-document files are not SQL-addressable.
+- `_yamlql_documents` is read-only, and scalar or null stream documents cannot
+  be written through SQL.
 - There is no concurrency control. Atomic replacement prevents torn files,
   not lost updates between writers.
-- The writer uses ruamel.yaml internals verified with version 0.19.1.
+- The writer requires `ruamel.yaml>=0.18.0,<0.20` and checks both that range
+  and required round-trip capabilities before it writes.
+
+## Batch list operations and measured scale
+
+Compatible multi-row `INSERT` and `DELETE` operations for the same list in the
+same document use one batch writer call. Cross-document, cross-list, mixed,
+and unsupported shapes use grouped or sequential handling. Batch insertion and
+deletion fail fast: an error rolls back the entire statement. For a rejected
+batch list insert, the policy message is:
+
+```text
+Cannot insert into table '<t>': <err>
+```
+
+The following recorded single-row INSERT measurements separate the in-memory
+writer edit from the deferred refresh and the complete statement. No 5,000-item
+timing was recorded.
+
+| Items | Writer edit | First post-edit refresh | Whole statement |
+| ---: | ---: | ---: | ---: |
+| 500 | 0.002100 s | 2.169384 s | 1.752429 s |
+| 1,000 | 0.002551 s | 7.750668 s | 4.805445 s |
+
+Refresh is super-linear in this measurement and is not included in the edit
+step. Whole-statement latency remains parse-bound and is not sub-second. In a
+separate whole-INSERT comparison (HEAD versus this implementation), 500 items
+took 2.87 s versus 1.89 s for one row and 145.35 s versus 2.03 s for 100 rows;
+1,000 items took 8.72 s versus 5.46 s for one row and 483.68 s versus 5.56 s
+for 100 rows.
 
 ## Error Handling
 

@@ -4,6 +4,15 @@
 
 YamlQL creates table relationships based on YAML structure, but these are implicit rather than formally tracked. Understanding these relationships helps you write effective queries.
 
+## Document-qualified relationships
+
+For multi-document streams with collections, legacy unqualified relations keep
+their later-definition-wins behavior. Use `doc{N}_{table}` to query or write a
+mapping table in one document, and `doc{N}` for a root-list document (with
+similarly prefixed child tables). `_yamlql_documents` describes the documents
+and is read-only. Scalar and null documents are represented in that metadata
+but cannot be written through SQL.
+
 ## How Relationships Work in YamlQL
 
 ### 1. Structural Relationships

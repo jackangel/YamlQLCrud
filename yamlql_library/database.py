@@ -18,6 +18,8 @@ class Database:
         self.interceptor = SqlInterceptor()
         self.mode = mode
         self.file_path = file_path
+        self.mapping_column_paths: Dict[str, Dict[str, tuple]] = {}
+        self.table_doc_map: Dict[str, Any] = {}
         
         # CRUD handlers (initialized after transformation via initialize_crud_handlers)
         self.insert_handler: Optional[InsertHandler] = None
@@ -32,13 +34,22 @@ class Database:
             tables: A list of tuples, where each tuple contains a table name
                     and the corresponding DataFrame.
         """
-        for name, df in tables:
-            self.con.register(name, df)
+        registered_names = []
+        try:
+            for name, df in tables:
+                self.con.register(name, df)
+                registered_names.append(name)
+        except Exception:
+            for name in registered_names:
+                self.con.unregister(name)
+            raise
     
     def initialize_crud_handlers(
         self,
         column_name_map: Dict[str, Dict[str, str]],
-        original_data: dict
+        mapping_column_paths: Dict[str, Dict[str, tuple]],
+        original_data: dict,
+        table_doc_map: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Initialize CRUD handlers with transformation metadata.
@@ -55,11 +66,14 @@ class Database:
         # Only initialize handlers if in write mode
         if self.mode not in ['rw', 'w']:
             return
+
+        self.table_doc_map = table_doc_map or self.table_doc_map
         
         # Initialize all three CRUD handlers
         self.insert_handler = InsertHandler(
             file_path=self.file_path,
             column_name_map=column_name_map,
+            mapping_column_paths=mapping_column_paths,
             original_data=original_data,
             db=self
         )
@@ -67,6 +81,7 @@ class Database:
         self.update_handler = UpdateHandler(
             file_path=self.file_path,
             column_name_map=column_name_map,
+            mapping_column_paths=mapping_column_paths,
             original_data=original_data,
             db=self
         )
@@ -74,9 +89,12 @@ class Database:
         self.delete_handler = DeleteHandler(
             file_path=self.file_path,
             column_name_map=column_name_map,
+            mapping_column_paths=mapping_column_paths,
             original_data=original_data,
             db=self
         )
+        for handler in (self.insert_handler, self.update_handler, self.delete_handler):
+            handler.table_doc_map = self.table_doc_map
 
     def query(self, sql_query: str) -> pd.DataFrame:
         """
@@ -128,7 +146,15 @@ class Database:
                 )
         
         # Execute SELECT/DDL queries in DuckDB (existing behavior)
-        return self.con.execute(sql_query).fetchdf()
+        result = self.con.execute(sql_query).fetchdf()
+        mapping_columns = {
+            column
+            for columns in self.mapping_column_paths.values()
+            for column in columns
+        }
+        for column in mapping_columns.intersection(result.columns):
+            result[column] = result[column].astype(object).where(result[column].notna(), None)
+        return result
     
     def _handle_insert(self, parsed_sql) -> Dict[str, Any]:
         """

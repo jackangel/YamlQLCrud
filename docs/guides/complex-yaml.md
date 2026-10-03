@@ -113,6 +113,39 @@ SELECT
 FROM services;
 ```
 
+When an anchor name is reused, an alias resolves to the nearest preceding
+definition with that name in the same document; anchor identity never crosses
+document boundaries. If a write cannot establish that identity, it is rejected
+without changing the file:
+
+```text
+Cannot resolve anchor '<name>' identity in document <N>
+```
+
+A multi-row update that changes an alias in one same-name-anchor group to a
+literal and then edits a definition in another group is intentionally rejected
+rather than guessed.
+
+### Mapping fields and document streams
+
+Flattened mapping fields are the default SQL view. Python callers can add
+canonical-JSON mapping columns with `YamlQL(path, expose_mapping_columns=True)`.
+Their JSON uses sorted keys and compact separators, retains non-ASCII text,
+uses ISO-8601 dates/times, sorted arrays for sets, and base64 for bytes. A
+mapping column whose name collides with an existing scalar or flattened column
+is skipped; unrepresentable values are `NULL`.
+
+A JSON object update replaces the whole mapping in the writer's style. It does
+not retain child comments, child quote styles, or child tags. Non-object or
+invalid JSON, JSON `null`, and SQL `NULL` are rejected through `UPDATE failed:`;
+merge keys, aliased descendants, and parent/child column conflicts are also
+rejected before writing.
+
+For a multi-document stream, use `doc{N}_{table}` for a mapping relation and
+`doc{N}` for a root-list relation, including its child tables. The
+`_yamlql_documents` metadata table is read-only. Scalar and null documents are
+not writable. Unqualified relations continue to select the later definition.
+
 ## Advanced Querying
 
 ### 1. Dynamic Paths

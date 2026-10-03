@@ -18,7 +18,7 @@ dependencies = [
     "prompt-toolkit>=3.0.47",
     "pytest>=8.4.0",
     "sqlglot>=23.0.0",
-    "ruamel.yaml>=0.18.0",
+    "ruamel.yaml>=0.18.0,<0.20",
 ]
 
 [project.optional-dependencies]
@@ -41,3 +41,8 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["yamlql_library*"] 
+
+[tool.pytest.ini_options]
+markers = [
+    "perf: performance characterization and generous timing-ceiling tests",
+]
